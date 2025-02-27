@@ -28,9 +28,7 @@ fn main() -> io::Result<()> {
 
     // トークンを一覧表示（デバッグ用）
     println!("--- Tokens ---");
-    for token in &tokens {
-        println!("{:?}", token);
-    }
+    println!("{:?}", tokens);
 
     // ===============================
     // 2. 構文解析 (Parser)
@@ -40,6 +38,12 @@ fn main() -> io::Result<()> {
         Ok(ast) => {
             println!("\n--- Parsed AST ---");
             println!("{:#?}", ast);
+            // 出力内容をファイルに書き込む
+            let output_filename = format!("{}.ast", filename
+                .split(".")
+                .next()
+                .unwrap_or(filename));
+            fs::write(output_filename, format!("{:#?}", ast))?;
         }
         Err(e) => {
             eprintln!("Parse Error: {}", e);

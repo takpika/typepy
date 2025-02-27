@@ -66,6 +66,7 @@ pub enum Token {
     Plus,      // +
     Minus,     // -
     Star,      // *
+    StarStar,  // **
     Slash,     // /
     Percent,   // %
     Caret,     // ^
@@ -73,6 +74,7 @@ pub enum Token {
     Pipe,      // |
     Bang,      // !
     Question,  // ?
+    QuestionQuestion, // ??
     Assign,    // =
     Arrow,     // ->  (例: login(...) -> bool)
     FatArrow,  // =>  (例: (x) => x * x)

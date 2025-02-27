@@ -241,13 +241,11 @@ impl<'a> Lexer<'a> {
     }
     
 
-    /// 文字列リテラルを読み取る (例: "hello")
     /// 文字列リテラルを読み取る (シングルクォート / ダブルクォート / 三重クォート対応)
     fn read_string(&mut self, quote_char: char) -> Token {
-        // 現在 self.pos はクォート直後を指している
-    
+        // 現在 self.pos は先頭のクォート直後を指している
+
         // まず「次の2文字が連続して quote_char なら三重クォート」とみなす
-        // 例: すでに1つ目は消費済み => 残りの2つがあるかどうかを peek で確認
         if self.peek_char(0) == quote_char && self.peek_char(1) == quote_char {
             // 三重クォートモード => consume 2つ
             self.advance(); // 2つ目
@@ -256,23 +254,43 @@ impl<'a> Lexer<'a> {
         } else {
             // 通常のシングルライン文字列
             let mut result = String::new();
-    
+        
             loop {
                 if self.is_at_end() {
-                    // EOF => 終了クォートが見つからない
+                    // EOF に達した場合は閉じクォートが無いので終了
                     break;
                 }
                 let c = self.current_char();
                 if c == quote_char {
-                    // 閉じクォートを見つけたので消費して終了
+                    // 閉じクォートを検出したら消費して終了
                     self.advance();
                     break;
                 }
-                // エスケープ処理などは省略
-                result.push(c);
-                self.advance();
+                // エスケープシーケンス処理
+                if c == '\\' {
+                    self.advance(); // バックスラッシュを消費
+                    if self.is_at_end() {
+                        break;
+                    }
+                    let escaped = self.current_char();
+                    self.advance();
+                    // 簡易的なエスケープ処理
+                    let esc_char = match escaped {
+                        'n'  => '\n',
+                        't'  => '\t',
+                        'r'  => '\r',
+                        '\\' => '\\',
+                        '"'  => '"',
+                        '\'' => '\'',
+                        other => other,  // 未対応のものはそのまま
+                    };
+                    result.push(esc_char);
+                } else {
+                    result.push(c);
+                    self.advance();
+                }
             }
-    
+        
             return Token::StringLiteral(result);
         }
     }
@@ -368,7 +386,13 @@ impl<'a> Lexer<'a> {
                     return Token::Dot;
                 }
             }
-            '?' => { self.advance(); return Token::Question; }
+            '?' => {
+                self.advance();
+                if self.match_char('?') {
+                    return Token::QuestionQuestion;
+                }
+                return Token::Question;
+            }
             '=' => {
                 self.advance();
                 if self.match_char('=') {
@@ -398,6 +422,8 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 if self.match_char('=') {
                     return Token::StarEqual;
+                } else if self.match_char('*') {
+                    return Token::StarStar;
                 }
                 return Token::Star;
             }
