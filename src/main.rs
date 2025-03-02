@@ -2,7 +2,9 @@ mod lexer;
 mod token;
 mod keyword_map;
 mod parser;
+mod analyzer;
 
+use core::panic;
 use std::fs;
 use std::io;
 use std::env;
@@ -34,7 +36,7 @@ fn main() -> io::Result<()> {
     // 2. 構文解析 (Parser)
     // ===============================
     let mut parser = parser::Parser::new(tokens);
-    match parser.parse_file() {
+    let parse_result = match parser.parse_file() {
         Ok(ast) => {
             println!("\n--- Parsed AST ---");
             println!("{:#?}", ast);
@@ -44,9 +46,25 @@ fn main() -> io::Result<()> {
                 .next()
                 .unwrap_or(filename));
             fs::write(output_filename, format!("{:#?}", ast))?;
+            Ok::<_, io::Error>(ast)
         }
         Err(e) => {
             eprintln!("Parse Error: {}", e);
+            panic!();
+        }
+    }?;
+
+    // ===============================
+    // 3. 意味解析 (Analyzer)
+    // ===============================
+    let mut analyzer = analyzer::Analyzer::new(parse_result);
+    match analyzer.analyze() {
+        Ok(_) => {
+            println!("Analysis OK");
+        },
+        Err(e) => {
+            eprintln!("Analyze Error: {}", e);
+            panic!();
         }
     }
 
