@@ -1,0 +1,17 @@
+# 構造体と辞書の操作例
+struct User {
+    name: str;
+    age: uint8;
+}
+
+def make_map(list: [User]) -> {str: uint8} {
+    let map: {str: uint8} = {};
+    for u in list {
+        map[u.name] = u.age;
+    }
+    return map;
+}
+
+let users = [User("Alice", 30), User("Bob", 25)];
+let age_map = make_map(users);
+print(age_map["Bob"]);

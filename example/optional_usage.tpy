@@ -1,0 +1,10 @@
+# オプショナル型とチェーンのサンプル
+struct Profile {
+    nickname: str?;
+    age: uint8?;
+}
+
+let p = Profile(None, 20);
+print(p.nickname ?? "anonymous");
+let text: str? = None;
+print(text?.upper() ?? "EMPTY");

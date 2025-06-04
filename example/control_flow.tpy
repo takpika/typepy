@@ -1,0 +1,31 @@
+# 制御構造とコレクションのサンプル
+
+enum Day {
+    mon,
+    tue,
+    wed,
+    thu,
+    fri,
+    sat,
+    sun
+}
+
+def day_type(d: Day) -> str {
+    switch d {
+        case .sat { return "weekend"; }
+        case .sun { return "weekend"; }
+        default { return "weekday"; }
+    }
+}
+
+def sum_list(values: [uint32]) -> uint32 {
+    let total: uint32 = 0;
+    for v in values {
+        total += v;
+    }
+    return total;
+}
+
+let numbers = [1, 2, 3, 4, 5];
+print(day_type(.wed));
+print(sum_list(numbers));

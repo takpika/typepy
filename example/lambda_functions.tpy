@@ -1,0 +1,8 @@
+# ラムダ式のサンプル
+let add = (a: uint32, b: uint32) => a + b;
+let twice = (n: uint32) {
+    return n * 2;
+};
+
+print(add(3, 5));
+print(twice(8));

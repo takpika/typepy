@@ -1,0 +1,15 @@
+# 例外処理とオプショナル型のサンプル
+
+def safe_div(x: uint32, y: uint32) -> uint32? {
+    try {
+        return x / y;
+    } catch e: ZeroDivisionError {
+        print("divide by zero");
+        return None;
+    } finally {
+        print("done");
+    }
+}
+
+print(safe_div(8, 2)!);
+print(safe_div(5, 0) ?? 0);

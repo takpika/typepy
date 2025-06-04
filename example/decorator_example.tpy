@@ -1,0 +1,15 @@
+# デコレータ利用例
+def log(fn: function() -> None) -> function() -> None {
+    return {
+        print("start");
+        fn();
+        print("end");
+    };
+}
+
+@log
+def hello() -> None {
+    print("hello");
+}
+
+hello();
