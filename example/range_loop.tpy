@@ -1,0 +1,11 @@
+# 範囲を使ったループ
+for i in 0..5 {
+    print(i);
+}
+
+for j in 5..<10 {
+    if j == 7 {
+        continue;
+    }
+    print(j);
+}

@@ -46,7 +46,9 @@ string bool
 使用できます。
 
 ## 実行例
-`example/example.tpy` にサンプルコードがあります。次のコマンドで
+`example/example.tpy` に加えて、`example/recursion.tpy` や
+`example/control_flow.tpy`、`example/error_handling.tpy`、
+`example/lambda_functions.tpy` など多数のサンプルを用意しています。次のコマンドで
 字句解析・構文解析結果を確認できます。
 
 ```bash
