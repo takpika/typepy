@@ -3,6 +3,7 @@ mod token;
 mod keyword_map;
 mod parser;
 mod analyzer;
+mod type_checker;
 
 use core::panic;
 use std::fs;
@@ -61,6 +62,20 @@ fn main() -> io::Result<()> {
         },
         Err(e) => {
             eprintln!("Analyze Error: {}", e);
+            panic!();
+        }
+    }
+
+    // ===============================
+    // 4. Type Checking
+    // ===============================
+    let mut checker = type_checker::TypeChecker::new(&analyzer.symbols);
+    match checker.check(&analyzer.root_node) {
+        Ok(_) => {
+            println!("Type Check OK");
+        },
+        Err(e) => {
+            eprintln!("Type Check Error: {}", e);
             panic!();
         }
     }

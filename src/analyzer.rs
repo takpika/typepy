@@ -16,6 +16,7 @@ pub struct Symbol {
 
 pub struct Analyzer {
     pub root_node: AstNode,
+    pub symbols: HashMap<String, Symbol>,
 }
 
 #[derive(Debug)]
@@ -34,7 +35,7 @@ pub enum AnalyzerError {
 
 impl Analyzer {
     pub fn new(root_node: AstNode) -> Self {
-        Self { root_node }
+        Self { root_node, symbols: HashMap::new() }
     }
 
     pub fn analyze(&mut self) -> Result<(), String> {
@@ -48,6 +49,7 @@ impl Analyzer {
                 return Err(format!("{:?}", e));
             }
         }
+        self.symbols = symbols;
         Ok(())
     }
 
