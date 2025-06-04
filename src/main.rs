@@ -41,10 +41,7 @@ fn main() -> io::Result<()> {
             println!("\n--- Parsed AST ---");
             println!("{:#?}", ast);
             // 出力内容をファイルに書き込む
-            let output_filename = format!("{}.ast", filename
-                .split(".")
-                .next()
-                .unwrap_or(filename));
+            let output_filename = format!("{}.ast", filename);
             fs::write(output_filename, format!("{:#?}", ast))?;
             Ok::<_, io::Error>(ast)
         }

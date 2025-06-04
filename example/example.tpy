@@ -1,0 +1,208 @@
+# モジュールのインポート
+import os;
+from random import random;
+import test as t;
+from test import test as t2, test2 as t3;
+
+struct Point {
+    x: int64;
+    y: int64;
+    title: str?;
+}
+
+# 🔹 ユーティリティクラス
+class Utils {
+    static def getCurrentTimestamp() -> uint64 {
+        return 1700000000;  # 仮のタイムスタンプ
+    }
+
+    static def hashPassword(password: str) -> str {
+        return f"hashed_{password}";
+    }
+
+    static def getServerName() -> str {
+        const name = "MainServer";
+        return name;
+    }
+}
+
+# 🔹 コンパイル時定数（const: ビルド時に決定、変更不可）
+const maxUsers: uint32 = 100;
+const version = "1.0.0"; # 型を指定しない場合は自動的に推論される
+const pi: float32 = 3.14159;
+
+# 🔹 ユーザーの権限（enum）
+enum Role {
+    admin,
+    user,
+    guest
+}
+
+# 🔹 ユーザークラス
+class User {
+    final username: str;
+    private final passwordHash: str;
+    final age: uint8;
+    final role: Role;
+    final userId: uint64;  # 実行時に決定し、変更不可
+    let handler: (function(uint64, uint32) -> ((str | uint32)?, str))?;
+
+    static let userCount: uint64 = 0;
+
+    def __init__(self, username: str, password: str, age: uint8, role: Role) {
+        self.username = username;
+        self.passwordHash = Utils.hashPassword(password);
+        self.age = age;
+        self.role = role;
+        self.userId = Utils.getCurrentTimestamp();  # 実行時に決定し、変更不可
+        User.userCount += 1;  # static変数の更新
+    }
+
+    # 役割を返す関数（switch 文）
+    def getRoleName() -> str {
+        switch self.role {
+            case .admin { return "Administrator"; }
+            case .user { return "Regular User"; }
+            case .guest { return "Guest User"; }
+            default { return "Unknown"; }
+        }
+    }
+
+    def setHandler(self, handler: function(uint64) -> str) -> None {
+        self.handler = handler;
+    }
+
+    # パスワードのチェック（private def）
+    private def checkPassword(self, inputPassword: str) -> bool {
+        return self.passwordHash == Utils.hashPassword(inputPassword);
+    }
+
+    # ログイン処理
+    def login(self, inputPassword: str) -> bool {
+        return self.checkPassword(inputPassword);
+    }
+}
+
+# 🔹 ユーザー管理クラス
+class UserManager {
+    const name = "UserManager";
+    static let users: [User] = [];
+    static let userIds: [str] = ["Alice", "Bob", "Charlie"];
+
+    # 新しいユーザーを追加
+    static def addUser(username: str, password: str, age: uint8, role: Role) -> str {
+        '''
+        新しいユーザーを追加します。
+        :param username: ユーザー名
+        :param password: パスワード
+        :param age: 年齢
+        :param role: 役割
+        :return: 処理結果
+        '''
+        if UserManager.users.length >= maxUsers {
+            return "User limit reached!";
+        }
+        final newUser = User(username, password, age, role);
+        UserManager.users.append(newUser);
+        return f"User {username} added successfully!";
+    }
+
+    # ユーザーリストを表示
+    static def listUsers() -> None {
+        for user in UserManager.users {
+            print(f"{user.username} ({user.age} years old) - {user.getRoleName()}");
+        }
+    }
+
+    @deprecated
+    def removeUser(self, username: str) -> str {
+        for i in 0..<UserManager.users.length {
+            if UserManager.users[i].username == username {
+                UserManager.users.removeAt(i);
+                return f"User {username} removed successfully!";
+            }
+        }
+        return "User not found!";
+    }
+}
+
+class TestUser(User) {
+    pass;
+}
+
+# 🔹 メイン処理
+final serverName = Utils.getServerName();  # 実行時に決定
+final startTime = Utils.getCurrentTimestamp();  # 実行時に決定
+
+UserManager.addUser("Alice", "password123", 30, .admin);
+UserManager.addUser("Bob", "securepass", 25, .user);
+UserManager.addUser("Charlie", "guest", 22, .guest);
+
+UserManager.listUsers();
+
+# ✅ ユーザーログイン
+final user: User? = UserManager.users[0];
+
+if final user = user {
+    print(user!.login("password123"));  # True
+}
+user?.setHandler({ userId in
+    return f"Message sent to {userIds}: {message}";
+})
+
+# ✅ None安全チェック
+final optionalUser: User? = None;
+print(optionalUser ?? "No user found.");  # "No user found."
+
+guard final user = optionalUser else {
+    print("User not found.");
+    exit(1);
+}
+
+# ✅ ラムダ式
+final square = (x: uint32) => x * x;
+final cube = (x: uint32) {
+    return x ** 3;
+};
+print(square(5));  # 25
+
+# ✅ タプル & 辞書
+final userData: {str: uint8} = {"Alice": 30, "Bob": 25};
+let userInfo: (str, uint8) = ("Charlie", 22);  # let で一部可変要素
+print(userData["Alice"]);  # 30
+print(userInfo[0]);  # "Charlie"
+
+# ✅ 変更可能な一部データ
+let counter: uint32 = 0;
+for i in 0..<10 {
+    counter += 1;
+}
+print(f"Counter: {counter}");
+
+final test = !(true && (1 + 1 > 0));
+
+# ✅ 例外処理
+try {
+    let result: uint32 = 10 / 0;
+} catch e: ZeroDivisionError {
+    print("Cannot divide by zero.");
+} catch e: Exception {
+    print("An error occurred: " + e.message);
+} finally {
+    print("Execution completed.");
+}
+
+try {
+    throw Exception("Custom error message.");
+} catch e: Exception {
+    print("An error occurred: " + e.message);
+}
+
+# ✅ モジュールの利用
+print(os.getcwd());
+print(random());
+
+@app.route("/hello")
+def hello() -> str {
+    return "Hello, World!";
+}
