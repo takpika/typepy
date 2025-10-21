@@ -4,6 +4,7 @@ mod keyword_map;
 mod parser;
 mod analyzer;
 mod transpiler;
+mod optimizer;
 
 use core::panic;
 use std::fs;
@@ -69,7 +70,9 @@ fn main() -> io::Result<()> {
     // ===============================
     // 3. 意味解析 (Analyzer)
     // ===============================
-    let mut analyzer = analyzer::Analyzer::new(parse_result);
+    let optimized_ast = optimizer::optimize_ast(parse_result);
+
+    let mut analyzer = analyzer::Analyzer::new(optimized_ast);
     if !use_std {
         analyzer.set_use_std(false);
     }
