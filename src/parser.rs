@@ -1,5 +1,48 @@
 use crate::lexer::Lexer;
-use crate::token::{Span, SpannedToken, Token};
+use crate::token::{Position, Span, SpannedToken, Token};
+use std::fmt;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParserError {
+    pub message: String,
+    pub span: Span,
+    pub snippet: Option<String>,
+}
+
+impl ParserError {
+    pub fn new<S: Into<String>>(message: S, span: Span, snippet: Option<String>) -> Self {
+        Self {
+            message: message.into(),
+            span,
+            snippet,
+        }
+    }
+}
+
+impl fmt::Display for ParserError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} (line {}:{}, line {}:{})",
+            self.message,
+            self.span.start.line,
+            self.span.start.column,
+            self.span.end.line,
+            self.span.end.column
+        )?;
+
+        if let Some(snippet) = &self.snippet {
+            write!(f, "\n{}", snippet)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl std::error::Error for ParserError {}
+
+pub type ParseResult<T> = Result<T, ParserError>;
 
 /// ========================
 ///        AST定義
@@ -282,14 +325,70 @@ pub enum LambdaBody {
 /// ========================
 
 pub struct Parser {
+    source: Arc<str>,
     tokens: Vec<SpannedToken>,
     pos: usize,
 }
 
 impl Parser {
+    fn fallback_span(&self) -> Span {
+        self.tokens.last().map(|t| t.span).unwrap_or_else(|| Span {
+            start: Position::new(0, 1, 0),
+            end: Position::new(0, 1, 0),
+        })
+    }
+
+    fn error<S: Into<String>>(&self, message: S) -> ParserError {
+        self.error_at(self.current_span(), message)
+    }
+
+    fn error_at<S: Into<String>>(&self, span: Option<Span>, message: S) -> ParserError {
+        let span = span.unwrap_or_else(|| self.fallback_span());
+        let snippet = self.make_snippet(span);
+        ParserError::new(message, span, snippet)
+    }
+
     /// コンストラクタ
-    pub fn new(tokens: Vec<SpannedToken>) -> Self {
-        Parser { tokens, pos: 0 }
+    pub fn new(source: Arc<str>, tokens: Vec<SpannedToken>) -> Self {
+        Parser {
+            source,
+            tokens,
+            pos: 0,
+        }
+    }
+
+    fn make_snippet(&self, span: Span) -> Option<String> {
+        if span.start.line == 0 {
+            return None;
+        }
+
+        let line_index = span.start.line.checked_sub(1)?;
+        let line = self.source.lines().nth(line_index)?.trim_end_matches('\r');
+
+        let line_len = line.chars().count();
+        let mut start_col = span.start.column;
+        if start_col > line_len {
+            start_col = line_len;
+        }
+
+        let caret_len = if span.start.line == span.end.line {
+            let mut end_col = span.end.column.max(span.start.column + 1);
+            if end_col > line_len {
+                end_col = line_len;
+            }
+            end_col.saturating_sub(start_col).max(1)
+        } else {
+            line_len.saturating_sub(start_col).max(1)
+        };
+
+        let mut caret_line = String::with_capacity(start_col + caret_len);
+        caret_line.extend(std::iter::repeat(' ').take(start_col));
+        caret_line.extend(std::iter::repeat('^').take(caret_len));
+
+        Some(format!(
+            "{:>4} | {}\n     | {}",
+            span.start.line, line, caret_line
+        ))
     }
 
     /// Indentトークンを連続でスキップするヘルパー
@@ -302,7 +401,7 @@ impl Parser {
     /// 指定したトークンが現在のトークンと一致するかチェックし、
     /// 一致していればそれを返して pos を1進める。
     /// 一致しなければエラーを返す。
-    pub fn expect(&mut self, expected: &Token) -> Result<Token, String> {
+    pub fn expect(&mut self, expected: &Token) -> ParseResult<Token> {
         let current = self.current_token();
         if current == *expected {
             // OK → advance() して返す
@@ -310,14 +409,17 @@ impl Parser {
             Ok(current)
         } else {
             // NG → エラー
-            Err(format!("Expected {:?}, but found {:?}", expected, current))
+            Err(self.error_at(
+                self.current_span(),
+                format!("Expected {:?}, but found {:?}", expected, current),
+            ))
         }
     }
 
     /// parse_type():
     ///  1) parse union type (one or more primary types joined by '|')
     ///  2) if there's a trailing '?', mark is_optional = true
-    pub fn parse_type(&mut self) -> Result<VarTypeField, String> {
+    pub fn parse_type(&mut self) -> ParseResult<VarTypeField> {
         // 1) parse union
         let mut types = vec![self.parse_primary_type()?];
 
@@ -352,7 +454,7 @@ impl Parser {
 
     /// parse_primary_type():
     ///   functionType | arrayType | dictType | tupleType | identifier
-    fn parse_primary_type(&mut self) -> Result<VarTypeField, String> {
+    fn parse_primary_type(&mut self) -> ParseResult<VarTypeField> {
         match self.current_token() {
             // function(...) -> T
             Token::Identifier(ref s) if s == "function" => self.parse_function_type(),
@@ -383,13 +485,15 @@ impl Parser {
                     args: vec![],
                 })
             }
-            ref other => Err(format!("parse_primary_type: Unexpected token: {:?}", other)),
+            ref other => {
+                Err(self.error(format!("parse_primary_type: Unexpected token: {:?}", other)))
+            }
         }
     }
 
     /// function(uint64) -> str
     /// function(...) -> Type
-    fn parse_function_type(&mut self) -> Result<VarTypeField, String> {
+    fn parse_function_type(&mut self) -> ParseResult<VarTypeField> {
         // consume "function"
         if let Token::Identifier(ref s) = self.current_token() {
             if s == "function" {
@@ -421,10 +525,10 @@ impl Parser {
 
         // expect '->'
         if self.current_token() != Token::Arrow {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '->' in function type, got {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume '->'
 
@@ -443,7 +547,7 @@ impl Parser {
     }
 
     /// array type: [T]
-    fn parse_array_type(&mut self) -> Result<VarTypeField, String> {
+    fn parse_array_type(&mut self) -> ParseResult<VarTypeField> {
         // consume '['
         self.expect(&Token::LBracket)?;
 
@@ -461,7 +565,7 @@ impl Parser {
     }
 
     /// dict type: {K : V}
-    fn parse_dict_type(&mut self) -> Result<VarTypeField, String> {
+    fn parse_dict_type(&mut self) -> ParseResult<VarTypeField> {
         // consume '{'
         self.expect(&Token::LBrace)?;
 
@@ -470,10 +574,10 @@ impl Parser {
 
         // expect ':'
         if self.current_token() != Token::Colon {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected ':' in dict type, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume ':'
 
@@ -490,7 +594,7 @@ impl Parser {
         })
     }
 
-    fn parse_tuple_type(&mut self) -> Result<VarTypeField, String> {
+    fn parse_tuple_type(&mut self) -> ParseResult<VarTypeField> {
         // 先頭の '(' を expect
         self.expect(&Token::LParen)?;
 
@@ -529,7 +633,7 @@ impl Parser {
     }
 
     /// メインエントリ: ファイル全体をパース
-    pub fn parse_file(&mut self) -> Result<AstNode, String> {
+    pub fn parse_file(&mut self) -> ParseResult<AstNode> {
         let mut items = Vec::new();
 
         loop {
@@ -546,16 +650,16 @@ impl Parser {
         Ok(AstNode::File(items))
     }
 
-    fn parse_switch_stmt(&mut self) -> Result<AstNode, String> {
+    fn parse_switch_stmt(&mut self) -> ParseResult<AstNode> {
         // 1) parse the expression after "switch"
         let switch_expr = self.parse_expr()?;
 
         // 2) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '{{' after switch expression, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume '{'
 
@@ -594,24 +698,24 @@ impl Parser {
                                 name
                             } else {
                                 return Err(
-                                    "Expected identifier after '.' in case pattern".to_string()
+                                    self.error("Expected identifier after '.' in case pattern")
                                 );
                             }
                         }
                         ref other => {
-                            return Err(format!(
+                            return Err(self.error(format!(
                                 "Expected identifier after 'case', found {:?}",
                                 other
-                            ));
+                            )));
                         }
                     };
 
                     // expect '{'
                     if self.current_token() != Token::LBrace {
-                        return Err(format!(
+                        return Err(self.error(format!(
                             "Expected '{{' after case pattern, found {:?}",
                             self.current_token()
-                        ));
+                        )));
                     }
                     self.advance(); // consume '{'
 
@@ -632,7 +736,7 @@ impl Parser {
                     if self.current_token() == Token::RBrace {
                         self.advance();
                     } else {
-                        return Err("Missing '}' after case body".to_string());
+                        return Err(self.error("Missing '}' after case body"));
                     }
 
                     cases.push(SwitchCase {
@@ -645,10 +749,10 @@ impl Parser {
                 Token::Default => {
                     self.advance(); // consume 'default'
                     if self.current_token() != Token::LBrace {
-                        return Err(format!(
+                        return Err(self.error(format!(
                             "Expected '{{' after default, found {:?}",
                             self.current_token()
-                        ));
+                        )));
                     }
                     self.advance(); // consume '{'
 
@@ -667,14 +771,16 @@ impl Parser {
                     if self.current_token() == Token::RBrace {
                         self.advance();
                     } else {
-                        return Err("Missing '}' after default body".to_string());
+                        return Err(self.error("Missing '}' after default body"));
                     }
                     default = Some(body_stmts);
                 }
 
                 // unexpected token
                 ref other => {
-                    return Err(format!("Expected 'case' or 'default', found {:?}", other));
+                    return Err(
+                        self.error(format!("Expected 'case' or 'default', found {:?}", other))
+                    );
                 }
             }
         }
@@ -683,10 +789,10 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else if self.current_token() != Token::Eof {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '}}' at end of switch, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
 
         Ok(AstNode::SwitchStmt {
@@ -696,13 +802,13 @@ impl Parser {
         })
     }
 
-    fn parse_try_stmt(&mut self) -> Result<AstNode, String> {
+    fn parse_try_stmt(&mut self) -> ParseResult<AstNode> {
         // 1) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '{{' after 'try', found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume '{'
 
@@ -721,7 +827,7 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
-            return Err("Missing '}' at end of try block".to_string());
+            return Err(self.error("Missing '}' at end of try block"));
         }
 
         // 4) parse catch blocks
@@ -780,10 +886,10 @@ impl Parser {
         if self.current_token() == Token::Finally {
             self.advance(); // consume 'finally'
             if self.current_token() != Token::LBrace {
-                return Err(format!(
+                return Err(self.error(format!(
                     "Expected '{{' after 'finally', found {:?}",
                     self.current_token()
-                ));
+                )));
             }
             self.advance(); // consume '{'
 
@@ -800,7 +906,7 @@ impl Parser {
             if self.current_token() == Token::RBrace {
                 self.advance();
             } else {
-                return Err("Missing '}' at end of finally block".to_string());
+                return Err(self.error("Missing '}' at end of finally block"));
             }
 
             finally_block = Some(finally_stmts);
@@ -813,7 +919,7 @@ impl Parser {
         })
     }
 
-    fn parse_if_stmt(&mut self) -> Result<AstNode, String> {
+    fn parse_if_stmt(&mut self) -> ParseResult<AstNode> {
         // 1) parse the condition
         let condition = match self.current_token() {
             Token::Final | Token::Let => {
@@ -836,7 +942,7 @@ impl Parser {
                                         expr: Box::new(expr.unwrap()),
                                     });
                                 }
-                                _ => return Err("Expected VarDecl in if condition".to_string()),
+                                _ => return Err(self.error("Expected VarDecl in if condition")),
                             }
                         }
                         _ => break,
@@ -861,10 +967,10 @@ impl Parser {
 
         // 2) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '{{' after if condition, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume '{'
 
@@ -883,7 +989,7 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
-            return Err("Missing '}' at end of if body".to_string());
+            return Err(self.error("Missing '}' at end of if body"));
         }
 
         // 5) check for "else" or "elif"
@@ -893,10 +999,10 @@ impl Parser {
 
             // 6) expect '{'
             if self.current_token() != Token::LBrace {
-                return Err(format!(
+                return Err(self.error(format!(
                     "Expected '{{' after else, found {:?}",
                     self.current_token()
-                ));
+                )));
             }
             self.advance(); // consume '{'
 
@@ -915,7 +1021,7 @@ impl Parser {
             if self.current_token() == Token::RBrace {
                 self.advance();
             } else {
-                return Err("Missing '}' at end of else body".to_string());
+                return Err(self.error("Missing '}' at end of else body"));
             }
 
             else_body = Some(else_stmts);
@@ -928,7 +1034,7 @@ impl Parser {
         })
     }
 
-    fn parse_for_stmt(&mut self) -> Result<AstNode, String> {
+    fn parse_for_stmt(&mut self) -> ParseResult<AstNode> {
         // 1) expect identifier
         let var_name = match self.current_token() {
             Token::Identifier(ref s) => {
@@ -937,19 +1043,19 @@ impl Parser {
                 name
             }
             ref other => {
-                return Err(format!(
+                return Err(self.error(format!(
                     "Expected identifier after 'for', found {:?}",
                     other
-                ));
+                )));
             }
         };
 
         // 2) expect "in"
         if self.current_token() != Token::In {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected 'in' after for loop variable, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume 'in'
 
@@ -958,10 +1064,10 @@ impl Parser {
 
         // 4) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '{{' after for loop, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume '{'
 
@@ -980,7 +1086,7 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
-            return Err("Missing '}' at end of for loop body".to_string());
+            return Err(self.error("Missing '}' at end of for loop body"));
         }
 
         Ok(AstNode::ForStmt {
@@ -990,7 +1096,7 @@ impl Parser {
         })
     }
 
-    fn parse_guard_stmt(&mut self) -> Result<AstNode, String> {
+    fn parse_guard_stmt(&mut self) -> ParseResult<AstNode> {
         let condition = match self.current_token() {
             Token::Final | Token::Let => {
                 let mut conditions = Vec::new();
@@ -1012,7 +1118,7 @@ impl Parser {
                                         expr: Box::new(expr.unwrap()),
                                     });
                                 }
-                                _ => return Err("Expected VarDecl in guard condition".to_string()),
+                                _ => return Err(self.error("Expected VarDecl in guard condition")),
                             }
                         }
                         _ => break,
@@ -1032,21 +1138,21 @@ impl Parser {
                     expr
                 }
             }
-            _ => return Err("Expected condition after 'guard'".to_string()),
+            _ => return Err(self.error("Expected condition after 'guard'")),
         };
 
         if self.current_token() != Token::Else {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected 'else' after guard condition, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance();
         if self.current_token() != Token::LBrace {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '{{' after 'else', found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance();
         let mut else_elms = Vec::new();
@@ -1059,7 +1165,7 @@ impl Parser {
             else_elms.push(stmt);
         }
         if self.current_token() != Token::RBrace {
-            return Err("Missing '}' at end of guard statement".to_string());
+            return Err(self.error("Missing '}' at end of guard statement"));
         }
         self.advance();
         Ok(AstNode::GuardStmt {
@@ -1069,7 +1175,7 @@ impl Parser {
     }
 
     /// import構文をパース (import xxx;)
-    fn parse_import(&mut self) -> Result<AstNode, String> {
+    fn parse_import(&mut self) -> ParseResult<AstNode> {
         let mut names = Vec::new();
 
         loop {
@@ -1081,10 +1187,10 @@ impl Parser {
                     nm
                 }
                 ref other => {
-                    return Err(format!(
+                    return Err(self.error(format!(
                         "Expected module name after 'import', got {:?}",
                         other
-                    ))
+                    )));
                 }
             };
 
@@ -1098,7 +1204,9 @@ impl Parser {
                         self.advance();
                     }
                     ref other => {
-                        return Err(format!("Expected alias name after 'as', got {:?}", other))
+                        return Err(
+                            self.error(format!("Expected alias name after 'as', got {:?}", other))
+                        );
                     }
                 }
             }
@@ -1128,7 +1236,7 @@ impl Parser {
         })
     }
 
-    fn parse_from_import(&mut self) -> Result<AstNode, String> {
+    fn parse_from_import(&mut self) -> ParseResult<AstNode> {
         // 例: "from <module> import <item>[, <item>]..."
         // 1) "from" はすでに消費済み
         // 2) expect module name => Identifier
@@ -1139,19 +1247,19 @@ impl Parser {
                 name
             }
             other => {
-                return Err(format!(
+                return Err(self.error(format!(
                     "Expected module name after 'from', got {:?}",
                     other
-                ))
+                )));
             }
         };
 
         // 3) expect "import"
         if self.current_token() != Token::Import {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected 'import', found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume 'import'
 
@@ -1166,10 +1274,10 @@ impl Parser {
                     name
                 }
                 other => {
-                    return Err(format!(
+                    return Err(self.error(format!(
                         "Expected identifier after 'import', got {:?}",
                         other
-                    ))
+                    )));
                 }
             };
 
@@ -1183,7 +1291,9 @@ impl Parser {
                         self.advance();
                     }
                     other => {
-                        return Err(format!("Expected alias name after 'as', got {:?}", other))
+                        return Err(
+                            self.error(format!("Expected alias name after 'as', got {:?}", other))
+                        );
                     }
                 }
             }
@@ -1212,20 +1322,20 @@ impl Parser {
         })
     }
 
-    fn parse_enum(&mut self) -> Result<AstNode, String> {
+    fn parse_enum(&mut self) -> ParseResult<AstNode> {
         let enum_name = match self.current_token() {
             Token::Identifier(ref s) => {
                 let name = s.clone();
                 self.advance();
                 name
             }
-            ref other => return Err(format!("Expected enum name, found {:?}", other)),
+            ref other => return Err(self.error(format!("Expected enum name, found {:?}", other))),
         };
         if self.current_token() != Token::LBrace {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '{{' after enum name, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance();
 
@@ -1241,7 +1351,9 @@ impl Parser {
                     self.advance();
                     name
                 }
-                ref other => return Err(format!("Expected enum variant name, found {:?}", other)),
+                ref other => {
+                    return Err(self.error(format!("Expected enum variant name, found {:?}", other)))
+                }
             };
             variants.push(variant_name);
             if self.current_token() == Token::Comma {
@@ -1252,7 +1364,7 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
-            return Err("Missing '}' at end of enum definition".to_string());
+            return Err(self.error("Missing '}' at end of enum definition"));
         }
 
         Ok(AstNode::EnumDef {
@@ -1261,7 +1373,7 @@ impl Parser {
         })
     }
 
-    fn parse_struct(&mut self) -> Result<AstNode, String> {
+    fn parse_struct(&mut self) -> ParseResult<AstNode> {
         // たとえば "struct Point { x: int64; y: int64; }"
         // 1) expect Identifier (構造体名)
         let struct_name = match self.current_token() {
@@ -1270,15 +1382,15 @@ impl Parser {
                 self.advance(); // consume the identifier
                 name
             }
-            ref other => return Err(format!("Expected struct name, found {:?}", other)),
+            ref other => return Err(self.error(format!("Expected struct name, found {:?}", other))),
         };
 
         // 2) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '{{' after struct name, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume '{'
 
@@ -1298,7 +1410,7 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
-            return Err("Missing '}' at end of struct definition".to_string());
+            return Err(self.error("Missing '}' at end of struct definition"));
         }
 
         // ここでASTノードを返す
@@ -1309,7 +1421,7 @@ impl Parser {
         })
     }
 
-    fn parse_struct_field(&mut self) -> Result<StructField, String> {
+    fn parse_struct_field(&mut self) -> ParseResult<StructField> {
         self.skip_indent();
         // expect Identifier (フィールド名)
         let field_name = match self.current_token() {
@@ -1318,15 +1430,15 @@ impl Parser {
                 self.advance();
                 f
             }
-            ref other => return Err(format!("Expected field name, found {:?}", other)),
+            ref other => return Err(self.error(format!("Expected field name, found {:?}", other))),
         };
 
         // expect ':'
         if self.current_token() != Token::Colon {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected ':' after field name, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume ':'
 
@@ -1344,7 +1456,7 @@ impl Parser {
         })
     }
 
-    fn parse_decorators(&mut self) -> Result<Vec<Decorator>, String> {
+    fn parse_decorators(&mut self) -> ParseResult<Vec<Decorator>> {
         let mut result = Vec::new();
         loop {
             self.skip_indent();
@@ -1372,7 +1484,7 @@ impl Parser {
     }
 
     /// class定義: class クラス名 { ... }
-    fn parse_class(&mut self) -> Result<AstNode, String> {
+    fn parse_class(&mut self) -> ParseResult<AstNode> {
         // expect identifier
         let class_name = match self.current_token() {
             Token::Identifier(ref s) => {
@@ -1381,7 +1493,7 @@ impl Parser {
                 n
             }
             ref other => {
-                return Err(format!("Expected class name, found {:?}", other));
+                return Err(self.error(format!("Expected class name, found {:?}", other)));
             }
         };
 
@@ -1396,7 +1508,9 @@ impl Parser {
                         n
                     }
                     ref other => {
-                        return Err(format!("Expected parent class name, found {:?}", other));
+                        return Err(
+                            self.error(format!("Expected parent class name, found {:?}", other))
+                        );
                     }
                 };
                 parents.push(parent);
@@ -1409,10 +1523,10 @@ impl Parser {
 
         // expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!(
+            return Err(self.error(format!(
                 "Expected '{{' after class name, found {:?}",
                 self.current_token()
-            ));
+            )));
         }
         self.advance(); // consume '{'
 
@@ -1431,7 +1545,7 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
-            return Err("Missing '}' in class definition".to_string());
+            return Err(self.error("Missing '}' in class definition"));
         }
 
         Ok(AstNode::ClassDef {
@@ -1448,7 +1562,7 @@ impl Parser {
         is_private: bool,
         has_parent: bool,
         decorators: Vec<Decorator>,
-    ) -> Result<AstNode, String> {
+    ) -> ParseResult<AstNode> {
         // 関数名
         let func_name = match self.current_token() {
             Token::Identifier(ref s) => {
@@ -1456,12 +1570,14 @@ impl Parser {
                 self.advance();
                 name
             }
-            ref other => return Err(format!("Expected function name, found {:?}", other)),
+            ref other => {
+                return Err(self.error(format!("Expected function name, found {:?}", other)))
+            }
         };
 
         // expect '('
         if self.current_token() != Token::LParen {
-            return Err("Expected '(' after function name".to_string());
+            return Err(self.error("Expected '(' after function name"));
         }
         self.advance(); // consume '('
 
@@ -1476,17 +1592,19 @@ impl Parser {
                     self.advance();
                     p
                 }
-                ref other => return Err(format!("Expected parameter name, got {:?}", other)),
+                ref other => {
+                    return Err(self.error(format!("Expected parameter name, got {:?}", other)))
+                }
             };
 
             if is_first && has_parent {
                 if self.current_token() == Token::Colon {
-                    return Err("Expected ':' in parameter".to_string());
+                    return Err(self.error("Expected ':' in parameter"));
                 }
             } else if self.current_token() == Token::Colon {
                 self.advance();
             } else {
-                return Err("Expected ':' in parameter".to_string());
+                return Err(self.error("Expected ':' in parameter"));
             }
 
             // param type
@@ -1515,7 +1633,7 @@ impl Parser {
         if self.current_token() == Token::RParen {
             self.advance();
         } else {
-            return Err("Missing ')' after function params".to_string());
+            return Err(self.error("Missing ')' after function params"));
         }
 
         // optional '-> returnType'
@@ -1534,7 +1652,7 @@ impl Parser {
 
         // expect '{'
         if self.current_token() != Token::LBrace {
-            return Err("Expected '{' in function definition".to_string());
+            return Err(self.error("Expected '{' in function definition"));
         }
         self.advance(); // consume '{'
 
@@ -1553,7 +1671,7 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
-            return Err("Missing '}' at end of function".to_string());
+            return Err(self.error("Missing '}' at end of function"));
         }
 
         Ok(AstNode::FunctionDef {
@@ -1573,12 +1691,12 @@ impl Parser {
         decl_token: Token,
         is_static: bool,
         is_private: bool,
-    ) -> Result<AstNode, String> {
+    ) -> ParseResult<AstNode> {
         let decl_type = match decl_token {
             Token::Final => VarDeclType::Final,
             Token::Let => VarDeclType::Let,
             Token::Const => VarDeclType::Const,
-            _ => return Err("Expected 'final', 'let', or 'const'".to_string()),
+            _ => return Err(self.error("Expected 'final', 'let', or 'const'")),
         };
         // var name
         let var_name = match self.current_token() {
@@ -1587,7 +1705,9 @@ impl Parser {
                 self.advance();
                 n
             }
-            ref other => return Err(format!("Expected variable name, found {:?}", other)),
+            ref other => {
+                return Err(self.error(format!("Expected variable name, found {:?}", other)))
+            }
         };
 
         let mut var_type = Some(String::new());
@@ -1598,7 +1718,7 @@ impl Parser {
             // if it's '=', set var_type to None
             var_type = None;
         } else {
-            return Err("Expected ':' in variable declaration".to_string());
+            return Err(self.error("Expected ':' in variable declaration"));
         }
 
         // var type
@@ -1632,7 +1752,7 @@ impl Parser {
     }
 
     /// ステートメント: return文 or 式文
-    fn parse_statement(&mut self, has_parent: bool) -> Result<AstNode, String> {
+    fn parse_statement(&mut self, has_parent: bool) -> ParseResult<AstNode> {
         self.skip_indent();
         let decorators = self.parse_decorators()?;
         match self.current_token() {
@@ -1694,10 +1814,10 @@ impl Parser {
                         self.advance();
                         self.parse_function(true, false, false, decorators)
                     }
-                    ref other => Err(format!(
+                    ref other => Err(self.error(format!(
                         "Expected 'let', 'final', or 'def' after 'static', found {:?}",
                         other
-                    )),
+                    ))),
                 }
             }
             Token::Private => {
@@ -1715,10 +1835,10 @@ impl Parser {
                         self.advance();
                         self.parse_function(false, true, has_parent, decorators)
                     }
-                    ref other => Err(format!(
+                    ref other => Err(self.error(format!(
                         "Expected 'let', 'final', or 'def' after 'private', found {:?}",
                         other
-                    )),
+                    ))),
                 }
             }
             Token::Return => {
@@ -1765,7 +1885,7 @@ impl Parser {
                 self.advance();
                 self.parse_guard_stmt()
             }
-            Token::Eof => Err("Unexpected EOF".to_string()),
+            Token::Eof => Err(self.error("Unexpected EOF")),
             _ => {
                 // 式ステートメントとみなす
                 let expr = self.parse_expr()?;
@@ -1799,12 +1919,12 @@ impl Parser {
     }
 
     /// 式のエントリポイント。最も低い優先順位である代入式から開始する。
-    pub fn parse_expr(&mut self) -> Result<Expr, String> {
+    pub fn parse_expr(&mut self) -> ParseResult<Expr> {
         self.parse_assignment_expr()
     }
 
     /// 代入式 (右結合)
-    fn parse_assignment_expr(&mut self) -> Result<Expr, String> {
+    fn parse_assignment_expr(&mut self) -> ParseResult<Expr> {
         let lhs = self.parse_logical_or_expr()?;
         // 単純代入
         if self.current_token() == Token::Assign {
@@ -1893,7 +2013,7 @@ impl Parser {
     }
 
     /// 論理和 (OR) のパース
-    fn parse_logical_or_expr(&mut self) -> Result<Expr, String> {
+    fn parse_logical_or_expr(&mut self) -> ParseResult<Expr> {
         let mut expr = self.parse_logical_and_expr()?;
         while self.current_token() == Token::Or {
             self.advance();
@@ -1908,7 +2028,7 @@ impl Parser {
     }
 
     /// 論理積 (AND) のパース
-    fn parse_logical_and_expr(&mut self) -> Result<Expr, String> {
+    fn parse_logical_and_expr(&mut self) -> ParseResult<Expr> {
         let mut expr = self.parse_equality_expr()?;
         while self.current_token() == Token::And {
             self.advance();
@@ -1923,7 +2043,7 @@ impl Parser {
     }
 
     /// 等価・不等価のパース
-    fn parse_equality_expr(&mut self) -> Result<Expr, String> {
+    fn parse_equality_expr(&mut self) -> ParseResult<Expr> {
         let mut expr = self.parse_relational_expr()?;
         loop {
             match self.current_token() {
@@ -1952,7 +2072,7 @@ impl Parser {
     }
 
     /// 比較 (関係) 演算子 (<, <=, >, >=) のパース
-    fn parse_relational_expr(&mut self) -> Result<Expr, String> {
+    fn parse_relational_expr(&mut self) -> ParseResult<Expr> {
         let mut expr = self.parse_additive_expr()?;
         loop {
             match self.current_token() {
@@ -1999,7 +2119,7 @@ impl Parser {
     }
 
     /// 加算・減算のパース
-    fn parse_additive_expr(&mut self) -> Result<Expr, String> {
+    fn parse_additive_expr(&mut self) -> ParseResult<Expr> {
         let mut expr = self.parse_multiplicative_expr()?;
         loop {
             match self.current_token() {
@@ -2028,7 +2148,7 @@ impl Parser {
     }
 
     /// 乗算・除算・剰余のパース
-    fn parse_multiplicative_expr(&mut self) -> Result<Expr, String> {
+    fn parse_multiplicative_expr(&mut self) -> ParseResult<Expr> {
         let mut expr = self.parse_unary_expr()?;
         loop {
             match self.current_token() {
@@ -2075,7 +2195,7 @@ impl Parser {
     }
 
     /// 単項演算子のパース (-, !など)
-    fn parse_unary_expr(&mut self) -> Result<Expr, String> {
+    fn parse_unary_expr(&mut self) -> ParseResult<Expr> {
         match self.current_token() {
             Token::Minus => {
                 self.advance();
@@ -2097,7 +2217,7 @@ impl Parser {
         }
     }
 
-    fn parse_primary_expr(&mut self) -> Result<Expr, String> {
+    fn parse_primary_expr(&mut self) -> ParseResult<Expr> {
         let tok = self.current_token();
         let mut expr = match tok {
             // Identifier => 関数呼び出しの可能性もチェック
@@ -2146,7 +2266,9 @@ impl Parser {
                         }
                     }
                     ref other => {
-                        return Err(format!("Expected identifier after '.', found {:?}", other));
+                        return Err(
+                            self.error(format!("Expected identifier after '.', found {:?}", other))
+                        );
                     }
                 }
             }
@@ -2159,7 +2281,7 @@ impl Parser {
                 Expr::NoneLiteral
             }
             ref other => {
-                return Err(format!("Unexpected token in expression: {:?}", other));
+                return Err(self.error(format!("Unexpected token in expression: {:?}", other)));
             }
         };
         loop {
@@ -2176,7 +2298,9 @@ impl Parser {
                         expr = member_expr;
                     }
                     ref other => {
-                        return Err(format!("Expected identifier after '.', found {:?}", other));
+                        return Err(
+                            self.error(format!("Expected identifier after '.', found {:?}", other))
+                        );
                     }
                 }
             } else if self.current_token() == Token::LParen {
@@ -2207,7 +2331,7 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_paren_expr(&mut self) -> Result<Expr, String> {
+    fn parse_paren_expr(&mut self) -> ParseResult<Expr> {
         // 1) consume '('
         self.expect(&Token::LParen)?;
 
@@ -2222,7 +2346,7 @@ impl Parser {
         }
     }
 
-    fn check_if_lambda(&mut self) -> Result<bool, String> {
+    fn check_if_lambda(&mut self) -> ParseResult<bool> {
         let saved_pos = self.pos;
 
         // スキップ空白など
@@ -2308,7 +2432,7 @@ impl Parser {
         Ok(false)
     }
 
-    fn parse_lambda_expr(&mut self) -> Result<Expr, String> {
+    fn parse_lambda_expr(&mut self) -> ParseResult<Expr> {
         // すでに '(' は消費済み in parse_paren_expr().
 
         let mut params = Vec::new();
@@ -2318,7 +2442,9 @@ impl Parser {
             // expect Identifier
             let param_name = match self.current_token() {
                 Token::Identifier(ref s) => s.clone(),
-                ref other => return Err(format!("Expected param name, got {:?}", other)),
+                ref other => {
+                    return Err(self.error(format!("Expected param name, got {:?}", other)))
+                }
             };
             self.advance();
 
@@ -2372,11 +2498,11 @@ impl Parser {
                 body: LambdaBody::Block(stmts),
             })
         } else {
-            Err("Expected '=>' or '{' after lambda parameter list".to_string())
+            Err(self.error("Expected '=>' or '{' after lambda parameter list"))
         }
     }
 
-    fn parse_tuple_expr(&mut self) -> Result<Expr, String> {
+    fn parse_tuple_expr(&mut self) -> ParseResult<Expr> {
         // '(' は呼び出し元で consume済み
         // 要素が0個以上で、')' まで読み込む
         let mut elems = Vec::new();
@@ -2414,7 +2540,7 @@ impl Parser {
         Ok(Expr::TupleLiteral(elems))
     }
 
-    fn parse_dict_or_function_expr(&mut self) -> Result<Expr, String> {
+    fn parse_dict_or_function_expr(&mut self) -> ParseResult<Expr> {
         // 1) consume '{'
         self.expect(&Token::LBrace)?;
 
@@ -2432,7 +2558,7 @@ impl Parser {
         }
     }
 
-    fn parse_dict_literal_body(&mut self) -> Result<Expr, String> {
+    fn parse_dict_literal_body(&mut self) -> ParseResult<Expr> {
         let mut pairs = Vec::new();
 
         loop {
@@ -2467,19 +2593,19 @@ impl Parser {
                 }
                 // 他はエラー
                 ref other => {
-                    return Err(format!(
+                    return Err(self.error(format!(
                         "Expected string literal or identifier as dict key, found {:?}",
                         other
-                    ));
+                    )));
                 }
             };
 
             // expect ':'
             if self.current_token() != Token::Colon {
-                return Err(format!(
+                return Err(self.error(format!(
                     "Expected ':' after dict key, found {:?}",
                     self.current_token()
-                ));
+                )));
             }
             self.advance(); // consume ':'
 
@@ -2498,7 +2624,7 @@ impl Parser {
         }
     }
 
-    fn parse_function_literal_body(&mut self) -> Result<Expr, String> {
+    fn parse_function_literal_body(&mut self) -> ParseResult<Expr> {
         // いま '{' はすでに消費済み
 
         let mut params = Vec::new();
@@ -2530,7 +2656,9 @@ impl Parser {
                     break;
                 }
                 ref other => {
-                    return Err(format!("Expected param name or 'in', found {:?}", other));
+                    return Err(
+                        self.error(format!("Expected param name or 'in', found {:?}", other))
+                    );
                 }
             }
         }
@@ -2551,7 +2679,7 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
-            return Err("Missing '}' at end of closure body".to_string());
+            return Err(self.error("Missing '}' at end of closure body"));
         }
 
         // 3) 関数リテラル作成
@@ -2562,7 +2690,7 @@ impl Parser {
         })
     }
 
-    fn parse_zero_param_function_literal_body(&mut self) -> Result<Expr, String> {
+    fn parse_zero_param_function_literal_body(&mut self) -> ParseResult<Expr> {
         let mut body_stmts = Vec::new();
 
         loop {
@@ -2577,7 +2705,7 @@ impl Parser {
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
-            return Err("Missing '}' at end of closure body".to_string());
+            return Err(self.error("Missing '}' at end of closure body"));
         }
 
         Ok(Expr::Function {
@@ -2587,7 +2715,7 @@ impl Parser {
     }
 
     /// 簡易実装: { param1, param2 in ... } とマッチすればtrue
-    fn check_if_function_literal(&mut self) -> Result<bool, String> {
+    fn check_if_function_literal(&mut self) -> ParseResult<bool> {
         // 一時的に現在のposを保存
         let saved_pos = self.pos;
 
@@ -2653,7 +2781,7 @@ impl Parser {
         Ok(false)
     }
 
-    fn check_if_zero_param_function_literal(&mut self) -> Result<bool, String> {
+    fn check_if_zero_param_function_literal(&mut self) -> ParseResult<bool> {
         let saved_pos = self.pos;
         self.skip_indent();
 
@@ -2673,12 +2801,12 @@ impl Parser {
         Ok(!looks_like_dict_key)
     }
 
-    fn parse_call_expr(&mut self, callee_expr: Expr) -> Result<Expr, String> {
+    fn parse_call_expr(&mut self, callee_expr: Expr) -> ParseResult<Expr> {
         // assume current_token() == Token::LParen => consume it
         if self.current_token() == Token::LParen {
             self.advance(); // consume '('
         } else {
-            return Err("Expected '(' in call expression".to_string());
+            return Err(self.error("Expected '(' in call expression"));
         }
 
         let mut args = Vec::new();
@@ -2696,7 +2824,7 @@ impl Parser {
         if self.current_token() == Token::RParen {
             self.advance();
         } else {
-            return Err("Missing ')' in function call".to_string());
+            return Err(self.error("Missing ')' in function call"));
         }
 
         // return a Call node
@@ -2706,7 +2834,7 @@ impl Parser {
         })
     }
 
-    fn parse_index_expr(&mut self, base_expr: Expr) -> Result<Expr, String> {
+    fn parse_index_expr(&mut self, base_expr: Expr) -> ParseResult<Expr> {
         // expect '['
         self.expect(&Token::LBracket)?;
 
@@ -2722,7 +2850,7 @@ impl Parser {
         })
     }
 
-    fn parse_array_literal(&mut self) -> Result<Expr, String> {
+    fn parse_array_literal(&mut self) -> ParseResult<Expr> {
         // consume '['
         self.expect(&Token::LBracket)?;
 
@@ -2777,6 +2905,14 @@ impl Parser {
         self.tokens.get(self.pos + n).map(|tok| tok.span)
     }
 
+    fn previous_span(&self) -> Option<Span> {
+        if self.pos == 0 {
+            None
+        } else {
+            self.tokens.get(self.pos - 1).map(|tok| tok.span)
+        }
+    }
+
     fn peek_non_indent_token(&self, n: usize) -> Token {
         let mut idx = self.pos + n;
         while idx < self.tokens.len() {
@@ -2797,16 +2933,17 @@ impl Parser {
     }
 }
 
-pub fn parse_inline_expr(source: &str) -> Result<Expr, String> {
-    let mut lexer = Lexer::new(source);
+pub fn parse_inline_expr(source: &str) -> ParseResult<Expr> {
+    let source_arc: Arc<str> = Arc::from(source);
+    let mut lexer = Lexer::new(&source_arc);
     let tokens = lexer.tokenize();
-    let mut parser = Parser::new(tokens);
+    let mut parser = Parser::new(source_arc, tokens);
     let expr = parser.parse_expr()?;
     match parser.current_token() {
         Token::Eof => Ok(expr),
-        unexpected => Err(format!(
-            "Unexpected token {:?} in inline expression",
-            unexpected
+        unexpected => Err(parser.error_at(
+            parser.current_span(),
+            format!("Unexpected token {:?} in inline expression", unexpected),
         )),
     }
 }
