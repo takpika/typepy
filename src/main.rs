@@ -3,11 +3,13 @@ mod token;
 mod keyword_map;
 mod parser;
 mod analyzer;
+mod transpiler;
 
 use core::panic;
 use std::fs;
 use std::io;
 use std::env;
+use std::path::Path;
 
 fn main() -> io::Result<()> {
     // コマンドライン引数からファイル名を取得
@@ -33,10 +35,8 @@ fn main() -> io::Result<()> {
     }
 
     let filename = &filenames[0];
-
     // ファイルの内容を読み込む
     let source_code = fs::read_to_string(filename)?;
-    
     // ===============================
     // 1. 字句解析 (Lexer)
     // ===============================
@@ -76,7 +76,11 @@ fn main() -> io::Result<()> {
     match analyzer.analyze() {
         Ok(_) => {
             println!("Analysis OK");
-        },
+            let python_code = transpiler::transpile_to_python(&analyzer.root_node);
+            let output_py = Path::new(filename).with_extension("py");
+            fs::write(&output_py, python_code)?;
+            println!("Transpiled Python written to {}", output_py.display());
+        }
         Err(e) => {
             eprintln!("Analyze Error: {}", e);
             panic!();
