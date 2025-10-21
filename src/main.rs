@@ -13,11 +13,26 @@ fn main() -> io::Result<()> {
     // コマンドライン引数からファイル名を取得
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <filename>", args[0]);
+        eprintln!("Usage: {} [--no-std] <filename>", args[0]);
         return Ok(());
     }
 
-    let filename = &args[1];
+    let mut use_std = true;
+    let mut filenames = Vec::new();
+    for arg in args.iter().skip(1) {
+        if arg == "--no-std" {
+            use_std = false;
+        } else {
+            filenames.push(arg.clone());
+        }
+    }
+
+    if filenames.is_empty() {
+        eprintln!("Usage: {} [--no-std] <filename>", args[0]);
+        return Ok(());
+    }
+
+    let filename = &filenames[0];
 
     // ファイルの内容を読み込む
     let source_code = fs::read_to_string(filename)?;
@@ -55,6 +70,9 @@ fn main() -> io::Result<()> {
     // 3. 意味解析 (Analyzer)
     // ===============================
     let mut analyzer = analyzer::Analyzer::new(parse_result);
+    if !use_std {
+        analyzer.set_use_std(false);
+    }
     match analyzer.analyze() {
         Ok(_) => {
             println!("Analysis OK");

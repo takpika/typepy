@@ -91,6 +91,8 @@ pub enum AstNode {
     ThrowStmt(Expr),
 
     PassStmt,
+    BreakStmt,
+    ContinueStmt,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1619,6 +1621,16 @@ impl Parser {
                 self.expect(&Token::Semicolon)?;
                 Ok(AstNode::PassStmt)
             }
+            Token::Break => {
+                self.advance();
+                self.expect(&Token::Semicolon)?;
+                Ok(AstNode::BreakStmt)
+            }
+            Token::Continue => {
+                self.advance();
+                self.expect(&Token::Semicolon)?;
+                Ok(AstNode::ContinueStmt)
+            }
             Token::Switch => {
                 self.advance(); // consume 'switch'
                 self.parse_switch_stmt()
@@ -2291,14 +2303,17 @@ impl Parser {
     fn parse_dict_or_function_expr(&mut self) -> Result<Expr, String> {
         // 1) consume '{'
         self.expect(&Token::LBrace)?;
-    
+
         // 2) 判定: この後が "param1, param2, ... in" という形ならFunctionリテラル
         //           そうでなければ辞書とみなす
         if self.check_if_function_literal()? {
             // 2-1) parse as function-literal
             self.parse_function_literal_body()
+        } else if self.check_if_zero_param_function_literal()? {
+            // 2-2) 引数なしの関数リテラル
+            self.parse_zero_param_function_literal_body()
         } else {
-            // 2-2) parse as dict-literal
+            // 2-3) parse as dict-literal
             self.parse_dict_literal_body()
         }
     }
@@ -2365,9 +2380,9 @@ impl Parser {
 
     fn parse_function_literal_body(&mut self) -> Result<Expr, String> {
         // いま '{' はすでに消費済み
-    
+
         let mut params = Vec::new();
-    
+
         // 1) 解析: param1, param2, ... in
         //    ※ check_if_function_literal で大まかに確認済だが、ここで本実装を行う
         loop {
@@ -2420,6 +2435,30 @@ impl Parser {
         // 今回は return_type=None, body=body_stmts
         Ok(Expr::Function {
             params,
+            body: body_stmts,
+        })
+    }
+
+    fn parse_zero_param_function_literal_body(&mut self) -> Result<Expr, String> {
+        let mut body_stmts = Vec::new();
+
+        loop {
+            self.skip_indent();
+            if self.current_token() == Token::RBrace || self.current_token() == Token::Eof {
+                break;
+            }
+            let stmt = self.parse_statement(false)?;
+            body_stmts.push(stmt);
+        }
+
+        if self.current_token() == Token::RBrace {
+            self.advance();
+        } else {
+            return Err("Missing '}' at end of closure body".to_string());
+        }
+
+        Ok(Expr::Function {
+            params: Vec::new(),
             body: body_stmts,
         })
     }
@@ -2489,6 +2528,26 @@ impl Parser {
         // そうでなければ functionじゃない
         self.pos = saved_pos;
         Ok(false)
+    }
+
+    fn check_if_zero_param_function_literal(&mut self) -> Result<bool, String> {
+        let saved_pos = self.pos;
+        self.skip_indent();
+
+        if self.current_token() == Token::RBrace {
+            self.pos = saved_pos;
+            return Ok(false);
+        }
+
+        let looks_like_dict_key = match self.current_token() {
+            Token::Identifier(_) | Token::StringLiteral(_) => {
+                matches!(self.peek_non_indent_token(1), Token::Colon)
+            }
+            _ => false,
+        };
+
+        self.pos = saved_pos;
+        Ok(!looks_like_dict_key)
     }
 
     fn parse_call_expr(&mut self, callee_expr: Expr) -> Result<Expr, String> {
@@ -2585,6 +2644,18 @@ impl Parser {
         } else {
             self.tokens[idx].clone()
         }
+    }
+
+    fn peek_non_indent_token(&self, n: usize) -> Token {
+        let mut idx = self.pos + n;
+        while idx < self.tokens.len() {
+            match &self.tokens[idx] {
+                Token::Indent(_) => idx += 1,
+                Token::Newline => idx += 1,
+                token => return token.clone(),
+            }
+        }
+        Token::Eof
     }
 
     /// 今のトークンを返して pos を1進める
