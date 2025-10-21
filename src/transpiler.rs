@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::mem;
 
 use crate::parser::{
-    AstNode, BinOp, CatchBlock, Expr, LambdaBody, StringLiteralType, SwitchCase, VarTypeField,
+    parse_inline_expr, AstNode, BinOp, CatchBlock, Expr, LambdaBody, StringLiteralType, SwitchCase,
+    VarTypeField,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -698,7 +700,7 @@ impl PythonTranspiler {
                 }
                 s
             }
-            Expr::StringLiteral { value, ty, .. } => self.render_string(value, ty),
+            Expr::StringLiteral { value, ty, vars } => self.render_string(value, ty, vars),
             Expr::BoolLiteral(value) => {
                 if *value {
                     "True".to_string()
@@ -991,14 +993,130 @@ impl PythonTranspiler {
         }
     }
 
-    fn render_string(&mut self, value: &str, ty: &StringLiteralType) -> String {
+    fn render_string(&mut self, value: &str, ty: &StringLiteralType, _vars: &[String]) -> String {
         let escaped = value.replace('\\', "\\\\");
         match ty {
             StringLiteralType::Format => {
-                if value.contains('\n') {
-                    format!("f\"\"\"{}\"\"\"", value)
+                enum FormatSegment {
+                    Text(String),
+                    Expr {
+                        leading: String,
+                        expr: String,
+                        trailing: String,
+                    },
+                }
+
+                let mut segments: Vec<FormatSegment> = Vec::new();
+                let mut current_text = String::new();
+                let chars: Vec<char> = value.chars().collect();
+                let mut idx = 0;
+                while idx < chars.len() {
+                    match chars[idx] {
+                        '{' => {
+                            if idx + 1 < chars.len() && chars[idx + 1] == '{' {
+                                current_text.push_str("{{");
+                                idx += 2;
+                                continue;
+                            }
+                            if !current_text.is_empty() {
+                                let text = mem::take(&mut current_text);
+                                segments.push(FormatSegment::Text(text));
+                            }
+                            let mut depth = 1;
+                            let mut end = idx + 1;
+                            while end < chars.len() {
+                                match chars[end] {
+                                    '{' => depth += 1,
+                                    '}' => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                end += 1;
+                            }
+                            if depth != 0 {
+                                current_text.push('{');
+                                idx += 1;
+                                continue;
+                            }
+                            let expr_content: String = chars[idx + 1..end].iter().collect();
+                            let trimmed_start = expr_content.trim_start();
+                            let leading_len = expr_content.len() - trimmed_start.len();
+                            let trimmed_end = trimmed_start.trim_end();
+                            let leading = &expr_content[..leading_len];
+                            let trailing = &trimmed_start[trimmed_end.len()..];
+                            let core = trimmed_end;
+                            let rendered = if core.is_empty() {
+                                core.to_string()
+                            } else {
+                                match parse_inline_expr(core) {
+                                    Ok(expr_ast) => self.transpile_expr(&expr_ast),
+                                    Err(_) => core.to_string(),
+                                }
+                            };
+                            segments.push(FormatSegment::Expr {
+                                leading: leading.to_string(),
+                                expr: rendered,
+                                trailing: trailing.to_string(),
+                            });
+                            idx = end + 1;
+                        }
+                        '}' => {
+                            if idx + 1 < chars.len() && chars[idx + 1] == '}' {
+                                current_text.push_str("}}");
+                                idx += 2;
+                            } else {
+                                current_text.push('}');
+                                idx += 1;
+                            }
+                        }
+                        other => {
+                            current_text.push(other);
+                            idx += 1;
+                        }
+                    }
+                }
+                if !current_text.is_empty() {
+                    let text = mem::take(&mut current_text);
+                    segments.push(FormatSegment::Text(text));
+                }
+
+                let mut raw_processed = String::new();
+                let mut escaped_single_processed = String::new();
+                for segment in segments {
+                    match segment {
+                        FormatSegment::Text(text) => {
+                            raw_processed.push_str(&text);
+                            let escaped = text.replace('\\', "\\\\").replace('\'', "\\\'");
+                            escaped_single_processed.push_str(&escaped);
+                        }
+                        FormatSegment::Expr {
+                            leading,
+                            expr,
+                            trailing,
+                        } => {
+                            raw_processed.push('{');
+                            raw_processed.push_str(&leading);
+                            raw_processed.push_str(&expr);
+                            raw_processed.push_str(&trailing);
+                            raw_processed.push('}');
+
+                            escaped_single_processed.push('{');
+                            escaped_single_processed.push_str(&leading);
+                            escaped_single_processed.push_str(&expr);
+                            escaped_single_processed.push_str(&trailing);
+                            escaped_single_processed.push('}');
+                        }
+                    }
+                }
+
+                if raw_processed.contains('\n') {
+                    format!("f\"\"\"{}\"\"\"", raw_processed)
                 } else {
-                    format!("f\"{}\"", escaped.replace('"', "\\\""))
+                    format!("f'{}'", escaped_single_processed)
                 }
             }
             StringLiteralType::Raw | StringLiteralType::Regex => {

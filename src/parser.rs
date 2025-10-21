@@ -1,3 +1,4 @@
+use crate::lexer::Lexer;
 use crate::token::Token;
 
 /// ========================
@@ -2663,5 +2664,19 @@ impl Parser {
         let tk = self.current_token();
         self.pos += 1;
         tk
+    }
+}
+
+pub fn parse_inline_expr(source: &str) -> Result<Expr, String> {
+    let mut lexer = Lexer::new(source);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    let expr = parser.parse_expr()?;
+    match parser.current_token() {
+        Token::Eof => Ok(expr),
+        unexpected => Err(format!(
+            "Unexpected token {:?} in inline expression",
+            unexpected
+        )),
     }
 }
