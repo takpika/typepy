@@ -4,3 +4,6 @@
 [Dd]esktop.ini
 
 Cargo.lock
+
+*.ast
+example/*.py
