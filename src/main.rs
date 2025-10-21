@@ -1,15 +1,15 @@
-mod lexer;
-mod token;
-mod keyword_map;
-mod parser;
 mod analyzer;
-mod transpiler;
+mod keyword_map;
+mod lexer;
 mod optimizer;
+mod parser;
+mod token;
+mod transpiler;
 
 use core::panic;
+use std::env;
 use std::fs;
 use std::io;
-use std::env;
 use std::path::Path;
 
 fn main() -> io::Result<()> {

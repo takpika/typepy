@@ -1,4 +1,38 @@
-/// 字句解析で得られるトークンを表す列挙体
+/// 入力中の位置を表す構造体。1文字ずつ進んだ際のバイトオフセットと行・列情報を保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    /// UTF-8バイト列における開始位置
+    pub offset: usize,
+    /// 1始まりの行番号
+    pub line: usize,
+    /// 0始まりの桁位置
+    pub column: usize,
+}
+
+impl Position {
+    pub fn new(offset: usize, line: usize, column: usize) -> Self {
+        Self {
+            offset,
+            line,
+            column,
+        }
+    }
+}
+
+/// トークンがどの範囲に対応するかを保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: Position,
+    pub end: Position,
+}
+
+impl Span {
+    pub fn new(start: Position, end: Position) -> Self {
+        Self { start, end }
+    }
+}
+
+/// 字句解析で得られるトークン種別を表す列挙体
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // 制御構文キーワード
@@ -6,7 +40,7 @@ pub enum Token {
     Else,
     For,
     In,
-    While,    // サンプルには出てきませんが一般的にあると想定
+    While, // サンプルには出てきませんが一般的にあると想定
     Switch,
     Case,
     Default,
@@ -41,8 +75,8 @@ pub enum Token {
     False,
 
     // デコレータ (@xxx)
-    AtSymbol,            // '@'
-    Decorator(String),   // 例: "@deprecated" をまるごと一つのトークンにするか分けるかは好み
+    AtSymbol,          // '@'
+    Decorator(String), // 例: "@deprecated" をまるごと一つのトークンにするか分けるかは好み
 
     // 識別子
     Identifier(String),
@@ -53,31 +87,31 @@ pub enum Token {
     StringLiteral(String),
 
     // 記号・演算子
-    LParen,    // (
-    RParen,    // )
-    LBrace,    // {
-    RBrace,    // }
-    LBracket,  // [
-    RBracket,  // ]
-    Comma,     // ,
-    Semicolon, // ;
-    Colon,     // :
-    Dot,       // .
-    Plus,      // +
-    Minus,     // -
-    Star,      // *
-    StarStar,  // **
-    Slash,     // /
-    Percent,   // %
-    Caret,     // ^
-    Amp,       // &
-    Pipe,      // |
-    Bang,      // !
-    Question,  // ?
+    LParen,           // (
+    RParen,           // )
+    LBrace,           // {
+    RBrace,           // }
+    LBracket,         // [
+    RBracket,         // ]
+    Comma,            // ,
+    Semicolon,        // ;
+    Colon,            // :
+    Dot,              // .
+    Plus,             // +
+    Minus,            // -
+    Star,             // *
+    StarStar,         // **
+    Slash,            // /
+    Percent,          // %
+    Caret,            // ^
+    Amp,              // &
+    Pipe,             // |
+    Bang,             // !
+    Question,         // ?
     QuestionQuestion, // ??
-    Assign,    // =
-    Arrow,     // ->  (例: login(...) -> bool)
-    FatArrow,  // =>  (例: (x) => x * x)
+    Assign,           // =
+    Arrow,            // ->  (例: login(...) -> bool)
+    FatArrow,         // =>  (例: (x) => x * x)
 
     // 二項演算子や比較演算子など、必要に応じて追加
     EqualEqual,    // ==
@@ -94,12 +128,12 @@ pub enum Token {
     CaretEqual,    // ^=
     AmpEqual,      // &=
     PipeEqual,     // |=
-    And,        // &&
-    Or,          // ||
+    And,           // &&
+    Or,            // ||
     ShiftLeft,     // <<
     ShiftRight,    // >>
     RangeHalfOpen, // ..<  (半開区間)
-    RangeClosed,  // ..   (閉区間)
+    RangeClosed,   // ..   (閉区間)
     // ... 必要なら適宜追加
 
     // インデント・改行管理（簡易的）
@@ -108,4 +142,17 @@ pub enum Token {
 
     // 終了
     Eof,
+}
+
+/// トークン種別とその位置情報をまとめた構造体
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpannedToken {
+    pub token: Token,
+    pub span: Span,
+}
+
+impl SpannedToken {
+    pub fn new(token: Token, span: Span) -> Self {
+        Self { token, span }
+    }
 }

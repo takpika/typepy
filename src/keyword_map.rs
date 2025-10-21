@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::token::Token;
+use std::collections::HashMap;
 
 pub fn build_keyword_map() -> HashMap<&'static str, Token> {
     let mut m = HashMap::new();

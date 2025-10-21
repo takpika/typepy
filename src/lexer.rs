@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use crate::token::Token;
 use crate::keyword_map::build_keyword_map;
+use crate::token::{Position, Span, SpannedToken, Token};
+use std::collections::HashMap;
 
 pub struct Lexer<'a> {
     input: &'a str,
@@ -43,7 +43,12 @@ impl<'a> Lexer<'a> {
         }
         let c = self.current_char();
         self.pos += c.len_utf8();
-        self.column += 1;
+        if c == '\n' {
+            self.line += 1;
+            self.column = 0;
+        } else {
+            self.column += 1;
+        }
         c
     }
 
@@ -55,6 +60,10 @@ impl<'a> Lexer<'a> {
         } else {
             false
         }
+    }
+
+    fn current_position(&self) -> Position {
+        Position::new(self.pos, self.line, self.column)
     }
 
     /// 行末までコメントを読み飛ばす (Pythonスタイル # ...)
@@ -127,7 +136,7 @@ impl<'a> Lexer<'a> {
     fn read_number(&mut self) -> Token {
         let start_pos = self.pos;
         let mut seen_dot = false;
-    
+
         // consume all digits first
         while !self.is_at_end() {
             let c = self.current_char();
@@ -152,7 +161,7 @@ impl<'a> Lexer<'a> {
                 break;
             }
         }
-    
+
         let literal = &self.input[start_pos..self.pos];
         // seen_dot が true なら float 解析
         // そうでなければ int 解析
@@ -172,22 +181,19 @@ impl<'a> Lexer<'a> {
             }
         }
     }
-    
 
     fn read_multiline_string(&mut self, quote_char: char) -> Token {
         let mut result = String::new();
-    
+
         loop {
             if self.is_at_end() {
                 // EOFに達してしまった => 終端がなかった
                 break;
             }
             let c = self.current_char();
-    
+
             // もし `"""` or `'''` の終端を見つけたら抜ける
-            if c == quote_char
-                && self.peek_char(1) == quote_char
-                && self.peek_char(2) == quote_char
+            if c == quote_char && self.peek_char(1) == quote_char && self.peek_char(2) == quote_char
             {
                 // consume 3つ
                 self.advance();
@@ -198,10 +204,10 @@ impl<'a> Lexer<'a> {
             result.push(c);
             self.advance();
         }
-    
+
         Token::StringLiteral(result)
-    }    
-    
+    }
+
     /// 現在の位置 self.pos から offset 文字先をのぞき見し、
     /// その文字を Some(char) で返す。
     /// もしファイル終端を超えていれば None を返す。
@@ -230,7 +236,7 @@ impl<'a> Lexer<'a> {
         let mut idx = self.pos;
         let len = self.input.len();
         let mut c: char = '\0';
-        for _ in 0..offset+1 {
+        for _ in 0..offset + 1 {
             if idx >= len {
                 return '\0';
             }
@@ -239,7 +245,6 @@ impl<'a> Lexer<'a> {
         }
         c
     }
-    
 
     /// 文字列リテラルを読み取る (シングルクォート / ダブルクォート / 三重クォート対応)
     fn read_string(&mut self, quote_char: char) -> Token {
@@ -254,7 +259,7 @@ impl<'a> Lexer<'a> {
         } else {
             // 通常のシングルライン文字列
             let mut result = String::new();
-        
+
             loop {
                 if self.is_at_end() {
                     // EOF に達した場合は閉じクォートが無いので終了
@@ -276,13 +281,13 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     // 簡易的なエスケープ処理
                     let esc_char = match escaped {
-                        'n'  => '\n',
-                        't'  => '\t',
-                        'r'  => '\r',
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
                         '\\' => '\\',
-                        '"'  => '"',
+                        '"' => '"',
                         '\'' => '\'',
-                        other => other,  // 未対応のものはそのまま
+                        other => other, // 未対応のものはそのまま
                     };
                     result.push(esc_char);
                 } else {
@@ -290,7 +295,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                 }
             }
-        
+
             return Token::StringLiteral(result);
         }
     }
@@ -318,205 +323,236 @@ impl<'a> Lexer<'a> {
     }
 
     /// 1トークンを読み取る
-    fn next_token(&mut self) -> Token {
+    fn next_token(&mut self) -> SpannedToken {
         // まず空白 + コメントをスキップ
         self.skip_whitespace_and_comments();
-    
+
+        let start_position = self.current_position();
+
         if self.is_at_end() {
-            return Token::Eof;
+            return SpannedToken::new(Token::Eof, Span::new(start_position, start_position));
         }
-    
+
         let c = self.current_char();
-    
+
         // 改行の場合
         if c == '\n' {
             self.advance();
-            // 行数を増やす
-            self.line += 1;
-            self.column = 0;
-            // 次の行頭スペースを読み取る
+            let indent_start = self.current_position();
             let indent_token = self.read_indent();
-            return indent_token;
+            let indent_end = self.current_position();
+            return SpannedToken::new(indent_token, Span::new(indent_start, indent_end));
         }
 
-        // 予約された記号類を判定
-        match c {
-            '{' => { self.advance(); return Token::LBrace; }
-            '}' => { self.advance(); return Token::RBrace; }
-            '(' => { self.advance(); return Token::LParen; }
-            ')' => { self.advance(); return Token::RParen; }
-            '[' => { self.advance(); return Token::LBracket; }
-            ']' => { self.advance(); return Token::RBracket; }
-            ',' => { self.advance(); return Token::Comma; }
-            ';' => { self.advance(); return Token::Semicolon; }
-            ':' => { self.advance(); return Token::Colon; }
+        let token = match c {
+            '{' => {
+                self.advance();
+                Token::LBrace
+            }
+            '}' => {
+                self.advance();
+                Token::RBrace
+            }
+            '(' => {
+                self.advance();
+                Token::LParen
+            }
+            ')' => {
+                self.advance();
+                Token::RParen
+            }
+            '[' => {
+                self.advance();
+                Token::LBracket
+            }
+            ']' => {
+                self.advance();
+                Token::RBracket
+            }
+            ',' => {
+                self.advance();
+                Token::Comma
+            }
+            ';' => {
+                self.advance();
+                Token::Semicolon
+            }
+            ':' => {
+                self.advance();
+                Token::Colon
+            }
             '|' => {
                 self.advance();
                 if self.match_char('|') {
-                    return Token::Or;
+                    Token::Or
                 } else if self.match_char('=') {
-                    return Token::PipeEqual;
+                    Token::PipeEqual
+                } else {
+                    Token::Pipe
                 }
-                return Token::Pipe;
             }
             '&' => {
                 self.advance();
                 if self.match_char('&') {
-                    return Token::And;
+                    Token::And
                 } else if self.match_char('=') {
-                    return Token::AmpEqual;
+                    Token::AmpEqual
+                } else {
+                    Token::Amp
                 }
-                return Token::Amp;
             }
             '.' => {
                 if self.peek_char(1) == '.' && self.peek_char(2) == '<' {
-                    // "..<" (half-open range)
                     self.advance();
                     self.advance();
                     self.advance();
-                    return Token::RangeHalfOpen;
+                    Token::RangeHalfOpen
                 } else if self.peek_char(1) == '.' {
-                    // ".." (closed range)
                     self.advance();
                     self.advance();
-                    return Token::RangeClosed;
+                    Token::RangeClosed
                 } else {
                     self.advance();
-                    return Token::Dot;
+                    Token::Dot
                 }
             }
             '?' => {
                 self.advance();
                 if self.match_char('?') {
-                    return Token::QuestionQuestion;
+                    Token::QuestionQuestion
+                } else {
+                    Token::Question
                 }
-                return Token::Question;
             }
             '=' => {
                 self.advance();
                 if self.match_char('=') {
-                    return Token::EqualEqual;
+                    Token::EqualEqual
                 } else if self.match_char('>') {
-                    return Token::FatArrow; // =>
+                    Token::FatArrow
+                } else {
+                    Token::Assign
                 }
-                return Token::Assign;
             }
             '-' => {
                 self.advance();
                 if self.match_char('>') {
-                    return Token::Arrow; // ->
+                    Token::Arrow
                 } else if self.match_char('=') {
-                    return Token::MinusEqual;
+                    Token::MinusEqual
+                } else {
+                    Token::Minus
                 }
-                return Token::Minus;
             }
             '+' => {
                 self.advance();
                 if self.match_char('=') {
-                    return Token::PlusEqual;
+                    Token::PlusEqual
+                } else {
+                    Token::Plus
                 }
-                return Token::Plus;
             }
             '*' => {
                 self.advance();
                 if self.match_char('=') {
-                    return Token::StarEqual;
+                    Token::StarEqual
                 } else if self.match_char('*') {
-                    return Token::StarStar;
+                    Token::StarStar
+                } else {
+                    Token::Star
                 }
-                return Token::Star;
             }
             '/' => {
                 self.advance();
                 if self.match_char('=') {
-                    return Token::SlashEqual;
+                    Token::SlashEqual
+                } else {
+                    Token::Slash
                 }
-                return Token::Slash;
             }
             '%' => {
                 self.advance();
                 if self.match_char('=') {
-                    return Token::PercentEqual;
+                    Token::PercentEqual
+                } else {
+                    Token::Percent
                 }
-                return Token::Percent;
             }
             '^' => {
                 self.advance();
                 if self.match_char('=') {
-                    return Token::CaretEqual;
+                    Token::CaretEqual
+                } else {
+                    Token::Caret
                 }
-                return Token::Caret;
             }
             '!' => {
                 self.advance();
                 if self.match_char('=') {
-                    return Token::NotEqual;
+                    Token::NotEqual
+                } else {
+                    Token::Bang
                 }
-                return Token::Bang;
             }
             '<' => {
                 self.advance();
                 if self.match_char('=') {
-                    return Token::LessEqual;
+                    Token::LessEqual
                 } else if self.match_char('<') {
-                    return Token::ShiftLeft;
+                    Token::ShiftLeft
+                } else {
+                    Token::Less
                 }
-                return Token::Less;
             }
             '>' => {
                 self.advance();
                 if self.match_char('=') {
-                    return Token::GreaterEqual;
+                    Token::GreaterEqual
                 } else if self.match_char('>') {
-                    return Token::ShiftRight;
+                    Token::ShiftRight
+                } else {
+                    Token::Greater
                 }
-                return Token::Greater;
             }
             '@' => {
-                // デコレータ or @シンボル
                 self.advance();
-                return self.read_decorator();
+                self.read_decorator()
             }
             '"' => {
-                // まずクォートの文字を取得
-                let quote_char = self.current_char(); // これは `"` のはず
-                self.advance(); // クォートを1回だけ消費
-                return self.read_string(quote_char);
-            }
-            // シングルクォート
-            '\'' => {
-                let quote_char = self.current_char(); // `\'`
+                let quote_char = c;
                 self.advance();
-                return self.read_string(quote_char);
+                self.read_string(quote_char)
+            }
+            '\'' => {
+                let quote_char = c;
+                self.advance();
+                self.read_string(quote_char)
             }
             _ => {
-                // 英字 => 識別子 or キーワード
                 if c.is_alphabetic() || c == '_' {
-                    return self.read_identifier();
+                    self.read_identifier()
+                } else if c.is_numeric() {
+                    self.read_number()
+                } else {
+                    self.advance();
+                    Token::Eof
                 }
-                // 数字 => 数値リテラル
-                if c.is_numeric() {
-                    return self.read_number();
-                }
-
-                // それ以外の文字はとりあえず無視 or エラー扱い (本来はエラーにするべき)
-                self.advance();
-                // エラー処理をどうするかは要検討
-                return Token::Eof; 
             }
-        }
-    }
+        };
 
+        let end_position = self.current_position();
+        SpannedToken::new(token, Span::new(start_position, end_position))
+    }
     /// 入力全体をトークンのベクタに変換する
-    pub fn tokenize(&mut self) -> Vec<Token> {
+    pub fn tokenize(&mut self) -> Vec<SpannedToken> {
         let mut tokens = Vec::new();
         loop {
             let tok = self.next_token();
-            if tok == Token::Eof {
-                tokens.push(Token::Eof);
+            let is_eof = tok.token == Token::Eof;
+            tokens.push(tok);
+            if is_eof {
                 break;
             }
-            tokens.push(tok);
         }
         tokens
     }
