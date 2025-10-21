@@ -1,5 +1,5 @@
 use crate::lexer::Lexer;
-use crate::token::Token;
+use crate::token::{Span, SpannedToken, Token};
 
 /// ========================
 ///        AST定義
@@ -26,12 +26,12 @@ pub enum AstNode {
     /// 関数定義 (例: `def greet(user: User) -> None { ... }`)
     FunctionDef {
         name: String,
-        params: Vec<(String, VarTypeField)>,   // (param_name, param_type)
-        return_type: Option<VarTypeField>,     // -> Some("None")など
-        body: Vec<AstNode>,              // 関数本体のステートメント
-        is_static: bool,                 // static 修飾子があれば true
-        is_private: bool,                // private 修飾子があれば true
-        decorators: Vec<Decorator>,      // デコレータ (@deprecated など)
+        params: Vec<(String, VarTypeField)>, // (param_name, param_type)
+        return_type: Option<VarTypeField>,   // -> Some("None")など
+        body: Vec<AstNode>,                  // 関数本体のステートメント
+        is_static: bool,                     // static 修飾子があれば true
+        is_private: bool,                    // private 修飾子があれば true
+        decorators: Vec<Decorator>,          // デコレータ (@deprecated など)
     },
 
     StructDef {
@@ -111,8 +111,8 @@ pub struct VarTypeField {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwitchCase {
-    pub pattern: String,         // 例: "admin", "user", etc.
-    pub body: Vec<AstNode>,      // caseの中身
+    pub pattern: String,    // 例: "admin", "user", etc.
+    pub body: Vec<AstNode>, // caseの中身
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,7 +147,7 @@ pub enum Expr {
     },
     BoolLiteral(bool),
 
-    /// 関数呼び出し: foo(...) 
+    /// 関数呼び出し: foo(...)
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
@@ -160,7 +160,7 @@ pub enum Expr {
 
     Lambda {
         params: Vec<(String, VarTypeField)>, // 引数名, 型
-        body: LambdaBody, // 例えば式 or 複数ステートメント
+        body: LambdaBody,                    // 例えば式 or 複数ステートメント
     },
 
     /// 2項演算子など(今回はサンプル)
@@ -282,13 +282,13 @@ pub enum LambdaBody {
 /// ========================
 
 pub struct Parser {
-    tokens: Vec<Token>,
+    tokens: Vec<SpannedToken>,
     pos: usize,
 }
 
 impl Parser {
     /// コンストラクタ
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<SpannedToken>) -> Self {
         Parser { tokens, pos: 0 }
     }
 
@@ -319,7 +319,7 @@ impl Parser {
     ///  2) if there's a trailing '?', mark is_optional = true
     pub fn parse_type(&mut self) -> Result<VarTypeField, String> {
         // 1) parse union
-        let mut types = vec![ self.parse_primary_type()? ];
+        let mut types = vec![self.parse_primary_type()?];
 
         // 連続で "|" が来たら、さらに primary_type を読む
         while self.current_token() == Token::Pipe {
@@ -355,21 +355,13 @@ impl Parser {
     fn parse_primary_type(&mut self) -> Result<VarTypeField, String> {
         match self.current_token() {
             // function(...) -> T
-            Token::Identifier(ref s) if s == "function" => {
-                self.parse_function_type()
-            }
+            Token::Identifier(ref s) if s == "function" => self.parse_function_type(),
             // [ T ]
-            Token::LBracket => {
-                self.parse_array_type()
-            }
+            Token::LBracket => self.parse_array_type(),
             // { K : V }
-            Token::LBrace => {
-                self.parse_dict_type()
-            }
+            Token::LBrace => self.parse_dict_type(),
             // ( T1, T2, ... )
-            Token::LParen => {
-                self.parse_tuple_type()
-            }
+            Token::LParen => self.parse_tuple_type(),
             // identifier
             Token::Identifier(ref s) => {
                 // e.g. "str", "int", or custom type name
@@ -391,9 +383,7 @@ impl Parser {
                     args: vec![],
                 })
             }
-            ref other => {
-                Err(format!("parse_primary_type: Unexpected token: {:?}", other))
-            }
+            ref other => Err(format!("parse_primary_type: Unexpected token: {:?}", other)),
         }
     }
 
@@ -403,7 +393,7 @@ impl Parser {
         // consume "function"
         if let Token::Identifier(ref s) = self.current_token() {
             if s == "function" {
-                self.advance(); 
+                self.advance();
             }
         }
 
@@ -419,7 +409,7 @@ impl Parser {
                 param_types.push(ty);
 
                 if self.current_token() == Token::Comma {
-                    self.advance(); 
+                    self.advance();
                 } else {
                     break;
                 }
@@ -431,7 +421,10 @@ impl Parser {
 
         // expect '->'
         if self.current_token() != Token::Arrow {
-            return Err(format!("Expected '->' in function type, got {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '->' in function type, got {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume '->'
 
@@ -477,7 +470,10 @@ impl Parser {
 
         // expect ':'
         if self.current_token() != Token::Colon {
-            return Err(format!("Expected ':' in dict type, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected ':' in dict type, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume ':'
 
@@ -497,15 +493,15 @@ impl Parser {
     fn parse_tuple_type(&mut self) -> Result<VarTypeField, String> {
         // 先頭の '(' を expect
         self.expect(&Token::LParen)?;
-    
+
         let mut tuple_elems = Vec::new();
-    
+
         if self.current_token() != Token::RParen {
             // parse at least one type
             loop {
                 let elem_ty = self.parse_type()?;
                 tuple_elems.push(elem_ty);
-    
+
                 if self.current_token() == Token::Comma {
                     self.advance(); // consume ','
                 } else {
@@ -513,10 +509,10 @@ impl Parser {
                 }
             }
         }
-    
+
         // expect ')'
         self.expect(&Token::RParen)?;
-    
+
         // もし要素数が1つなら「タプル」ではなく単なるグルーピング
         if tuple_elems.len() == 1 {
             // 例: (function(uint64) -> str)?
@@ -553,29 +549,32 @@ impl Parser {
     fn parse_switch_stmt(&mut self) -> Result<AstNode, String> {
         // 1) parse the expression after "switch"
         let switch_expr = self.parse_expr()?;
-    
+
         // 2) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!("Expected '{{' after switch expression, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '{{' after switch expression, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume '{'
-    
+
         let mut cases = Vec::new();
         let mut default = None;
-    
+
         // 3) parse case... or default... until '}'
         loop {
             self.skip_indent();
-    
+
             if self.current_token() == Token::RBrace || self.current_token() == Token::Eof {
                 break;
             }
-    
+
             match self.current_token() {
                 // case
                 Token::Case => {
                     self.advance(); // consume 'case'
-                    
+
                     // next is typically an identifier or maybe .identifier
                     // ここではシンプルに "admin", "user"などを想定
                     let pattern_str = match self.current_token() {
@@ -594,62 +593,77 @@ impl Parser {
                                 self.advance();
                                 name
                             } else {
-                                return Err("Expected identifier after '.' in case pattern".to_string());
+                                return Err(
+                                    "Expected identifier after '.' in case pattern".to_string()
+                                );
                             }
                         }
                         ref other => {
-                            return Err(format!("Expected identifier after 'case', found {:?}", other));
+                            return Err(format!(
+                                "Expected identifier after 'case', found {:?}",
+                                other
+                            ));
                         }
                     };
-    
+
                     // expect '{'
                     if self.current_token() != Token::LBrace {
-                        return Err(format!("Expected '{{' after case pattern, found {:?}", self.current_token()));
+                        return Err(format!(
+                            "Expected '{{' after case pattern, found {:?}",
+                            self.current_token()
+                        ));
                     }
                     self.advance(); // consume '{'
-    
+
                     // parse statements until '}'
                     let mut body_stmts = Vec::new();
                     loop {
                         self.skip_indent();
-                        if self.current_token() == Token::RBrace || self.current_token() == Token::Eof {
+                        if self.current_token() == Token::RBrace
+                            || self.current_token() == Token::Eof
+                        {
                             break;
                         }
                         let stmt = self.parse_statement(false)?;
                         body_stmts.push(stmt);
                     }
-    
+
                     // expect '}'
                     if self.current_token() == Token::RBrace {
                         self.advance();
                     } else {
                         return Err("Missing '}' after case body".to_string());
                     }
-    
+
                     cases.push(SwitchCase {
                         pattern: pattern_str,
                         body: body_stmts,
                     });
                 }
-    
+
                 // default
                 Token::Default => {
                     self.advance(); // consume 'default'
                     if self.current_token() != Token::LBrace {
-                        return Err(format!("Expected '{{' after default, found {:?}", self.current_token()));
+                        return Err(format!(
+                            "Expected '{{' after default, found {:?}",
+                            self.current_token()
+                        ));
                     }
                     self.advance(); // consume '{'
-    
+
                     let mut body_stmts = Vec::new();
                     loop {
                         self.skip_indent();
-                        if self.current_token() == Token::RBrace || self.current_token() == Token::Eof {
+                        if self.current_token() == Token::RBrace
+                            || self.current_token() == Token::Eof
+                        {
                             break;
                         }
                         let stmt = self.parse_statement(false)?;
                         body_stmts.push(stmt);
                     }
-    
+
                     if self.current_token() == Token::RBrace {
                         self.advance();
                     } else {
@@ -657,21 +671,24 @@ impl Parser {
                     }
                     default = Some(body_stmts);
                 }
-    
+
                 // unexpected token
                 ref other => {
                     return Err(format!("Expected 'case' or 'default', found {:?}", other));
                 }
             }
         }
-    
+
         // 4) now expect '}'
         if self.current_token() == Token::RBrace {
             self.advance();
         } else if self.current_token() != Token::Eof {
-            return Err(format!("Expected '}}' at end of switch, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '}}' at end of switch, found {:?}",
+                self.current_token()
+            ));
         }
-    
+
         Ok(AstNode::SwitchStmt {
             expr: switch_expr,
             cases,
@@ -682,10 +699,13 @@ impl Parser {
     fn parse_try_stmt(&mut self) -> Result<AstNode, String> {
         // 1) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!("Expected '{{' after 'try', found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '{{' after 'try', found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume '{'
-    
+
         // 2) parse statements until '}'
         let mut try_stmts = Vec::new();
         loop {
@@ -696,14 +716,14 @@ impl Parser {
             let stmt = self.parse_statement(false)?;
             try_stmts.push(stmt);
         }
-    
+
         // 3) expect '}'
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
             return Err("Missing '}' at end of try block".to_string());
         }
-    
+
         // 4) parse catch blocks
         // sample: catch e: Exception { ... }
         let mut catch_blocks = Vec::new();
@@ -760,7 +780,10 @@ impl Parser {
         if self.current_token() == Token::Finally {
             self.advance(); // consume 'finally'
             if self.current_token() != Token::LBrace {
-                return Err(format!("Expected '{{' after 'finally', found {:?}", self.current_token()));
+                return Err(format!(
+                    "Expected '{{' after 'finally', found {:?}",
+                    self.current_token()
+                ));
             }
             self.advance(); // consume '{'
 
@@ -801,12 +824,21 @@ impl Parser {
                             let token = self.current_token().clone();
                             self.advance();
                             match self.parse_var_decl(token, false, false)? {
-                                AstNode::VarDecl { name, expr, decl_type, .. } => {
-                                    conditions.push(Expr::VarDecl { name: name, decl_type: decl_type, expr: Box::new(expr.unwrap()) });
+                                AstNode::VarDecl {
+                                    name,
+                                    expr,
+                                    decl_type,
+                                    ..
+                                } => {
+                                    conditions.push(Expr::VarDecl {
+                                        name: name,
+                                        decl_type: decl_type,
+                                        expr: Box::new(expr.unwrap()),
+                                    });
                                 }
                                 _ => return Err("Expected VarDecl in if condition".to_string()),
                             }
-                        },
+                        }
                         _ => break,
                     }
                 }
@@ -815,20 +847,27 @@ impl Parser {
                 } else {
                     let mut expr = conditions.remove(0);
                     for cond in conditions {
-                        expr = Expr::Binary { left: Box::new(expr), op: BinOp::And, right: Box::new(cond) };
+                        expr = Expr::Binary {
+                            left: Box::new(expr),
+                            op: BinOp::And,
+                            right: Box::new(cond),
+                        };
                     }
                     expr
                 }
             }
-            _ => self.parse_expr()?
+            _ => self.parse_expr()?,
         };
 
         // 2) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!("Expected '{{' after if condition, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '{{' after if condition, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume '{'
-    
+
         // 3) parse statements until '}'
         let mut body_stmts = Vec::new();
         loop {
@@ -839,25 +878,28 @@ impl Parser {
             let stmt = self.parse_statement(false)?;
             body_stmts.push(stmt);
         }
-    
+
         // 4) expect '}'
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
             return Err("Missing '}' at end of if body".to_string());
         }
-    
+
         // 5) check for "else" or "elif"
         let mut else_body = None;
         if self.current_token() == Token::Else {
             self.advance(); // consume 'else'
-    
+
             // 6) expect '{'
             if self.current_token() != Token::LBrace {
-                return Err(format!("Expected '{{' after else, found {:?}", self.current_token()));
+                return Err(format!(
+                    "Expected '{{' after else, found {:?}",
+                    self.current_token()
+                ));
             }
             self.advance(); // consume '{'
-    
+
             // 7) parse statements until '}'
             let mut else_stmts = Vec::new();
             loop {
@@ -868,17 +910,17 @@ impl Parser {
                 let stmt = self.parse_statement(false)?;
                 else_stmts.push(stmt);
             }
-    
+
             // 8) expect '}'
             if self.current_token() == Token::RBrace {
                 self.advance();
             } else {
                 return Err("Missing '}' at end of else body".to_string());
             }
-    
+
             else_body = Some(else_stmts);
         }
-    
+
         Ok(AstNode::IfStmt {
             condition: Box::new(condition),
             body: body_stmts,
@@ -895,25 +937,34 @@ impl Parser {
                 name
             }
             ref other => {
-                return Err(format!("Expected identifier after 'for', found {:?}", other));
+                return Err(format!(
+                    "Expected identifier after 'for', found {:?}",
+                    other
+                ));
             }
         };
-    
+
         // 2) expect "in"
         if self.current_token() != Token::In {
-            return Err(format!("Expected 'in' after for loop variable, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected 'in' after for loop variable, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume 'in'
-    
+
         // 3) parse the iterable expression
         let iterable = self.parse_expr()?;
-    
+
         // 4) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!("Expected '{{' after for loop, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '{{' after for loop, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume '{'
-    
+
         // 5) parse statements until '}'
         let mut body_stmts = Vec::new();
         loop {
@@ -924,14 +975,14 @@ impl Parser {
             let stmt = self.parse_statement(false)?;
             body_stmts.push(stmt);
         }
-    
+
         // 6) expect '}'
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
             return Err("Missing '}' at end of for loop body".to_string());
         }
-    
+
         Ok(AstNode::ForStmt {
             var_name,
             iterable,
@@ -949,12 +1000,21 @@ impl Parser {
                             let token = self.current_token().clone();
                             self.advance();
                             match self.parse_var_decl(token, false, false)? {
-                                AstNode::VarDecl { name, expr, decl_type, .. } => {
-                                    conditions.push(Expr::VarDecl { name: name, decl_type: decl_type, expr: Box::new(expr.unwrap()) });
+                                AstNode::VarDecl {
+                                    name,
+                                    expr,
+                                    decl_type,
+                                    ..
+                                } => {
+                                    conditions.push(Expr::VarDecl {
+                                        name: name,
+                                        decl_type: decl_type,
+                                        expr: Box::new(expr.unwrap()),
+                                    });
                                 }
                                 _ => return Err("Expected VarDecl in guard condition".to_string()),
                             }
-                        },
+                        }
                         _ => break,
                     }
                 }
@@ -963,7 +1023,11 @@ impl Parser {
                 } else {
                     let mut expr = conditions.remove(0);
                     for cond in conditions {
-                        expr = Expr::Binary { left: Box::new(expr), op: BinOp::And, right: Box::new(cond) };
+                        expr = Expr::Binary {
+                            left: Box::new(expr),
+                            op: BinOp::And,
+                            right: Box::new(cond),
+                        };
                     }
                     expr
                 }
@@ -972,11 +1036,17 @@ impl Parser {
         };
 
         if self.current_token() != Token::Else {
-            return Err(format!("Expected 'else' after guard condition, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected 'else' after guard condition, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance();
         if self.current_token() != Token::LBrace {
-            return Err(format!("Expected '{{' after 'else', found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '{{' after 'else', found {:?}",
+                self.current_token()
+            ));
         }
         self.advance();
         let mut else_elms = Vec::new();
@@ -1001,7 +1071,7 @@ impl Parser {
     /// import構文をパース (import xxx;)
     fn parse_import(&mut self) -> Result<AstNode, String> {
         let mut names = Vec::new();
-    
+
         loop {
             // expect module name
             let module_name = match self.current_token() {
@@ -1010,9 +1080,14 @@ impl Parser {
                     self.advance(); // consume identifier
                     nm
                 }
-                ref other => return Err(format!("Expected module name after 'import', got {:?}", other)),
+                ref other => {
+                    return Err(format!(
+                        "Expected module name after 'import', got {:?}",
+                        other
+                    ))
+                }
             };
-    
+
             // optional 'as' alias
             let mut alias = None;
             if self.current_token() == Token::As {
@@ -1022,16 +1097,18 @@ impl Parser {
                         alias = Some(alias_name.clone());
                         self.advance();
                     }
-                    ref other => return Err(format!("Expected alias name after 'as', got {:?}", other)),
+                    ref other => {
+                        return Err(format!("Expected alias name after 'as', got {:?}", other))
+                    }
                 }
             }
-    
+
             // 追加
             names.push(ImportName {
                 name: module_name,
                 as_name: alias,
             });
-    
+
             // 次のトークンが ',' なら続ける
             if self.current_token() == Token::Comma {
                 self.advance(); // consume ','
@@ -1039,12 +1116,12 @@ impl Parser {
                 break; // import 列挙が終わった
             }
         }
-    
+
         // optional semicolon
         if self.current_token() == Token::Semicolon {
             self.advance();
         }
-    
+
         Ok(AstNode::Import {
             module: None,
             names,
@@ -1061,17 +1138,25 @@ impl Parser {
                 self.advance();
                 name
             }
-            other => return Err(format!("Expected module name after 'from', got {:?}", other)),
+            other => {
+                return Err(format!(
+                    "Expected module name after 'from', got {:?}",
+                    other
+                ))
+            }
         };
-    
+
         // 3) expect "import"
         if self.current_token() != Token::Import {
-            return Err(format!("Expected 'import', found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected 'import', found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume 'import'
-    
+
         let mut names = Vec::new();
-    
+
         loop {
             // 4) expect item name => Identifier
             let item_name = match self.current_token() {
@@ -1080,9 +1165,14 @@ impl Parser {
                     self.advance();
                     name
                 }
-                other => return Err(format!("Expected identifier after 'import', got {:?}", other)),
+                other => {
+                    return Err(format!(
+                        "Expected identifier after 'import', got {:?}",
+                        other
+                    ))
+                }
             };
-    
+
             // もし "as alias" があれば読む
             let mut alias = None;
             if self.current_token() == Token::As {
@@ -1092,15 +1182,17 @@ impl Parser {
                         alias = Some(s.clone());
                         self.advance();
                     }
-                    other => return Err(format!("Expected alias name after 'as', got {:?}", other)),
+                    other => {
+                        return Err(format!("Expected alias name after 'as', got {:?}", other))
+                    }
                 }
             }
-    
+
             names.push(ImportName {
                 name: item_name,
                 as_name: alias,
             });
-    
+
             // 次のトークンが ',' なら続ける
             if self.current_token() == Token::Comma {
                 self.advance(); // consume ','
@@ -1108,12 +1200,12 @@ impl Parser {
                 break; // import 列挙が終わった
             }
         }
-    
+
         // optional semicolon
         if self.current_token() == Token::Semicolon {
             self.advance();
         }
-    
+
         Ok(AstNode::Import {
             module: Some(module_name),
             names,
@@ -1130,7 +1222,10 @@ impl Parser {
             ref other => return Err(format!("Expected enum name, found {:?}", other)),
         };
         if self.current_token() != Token::LBrace {
-            return Err(format!("Expected '{{' after enum name, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '{{' after enum name, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance();
 
@@ -1177,13 +1272,16 @@ impl Parser {
             }
             ref other => return Err(format!("Expected struct name, found {:?}", other)),
         };
-    
+
         // 2) expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!("Expected '{{' after struct name, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '{{' after struct name, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume '{'
-    
+
         // 3) parse fields until '}'
         let mut fields = Vec::new();
         loop {
@@ -1195,14 +1293,14 @@ impl Parser {
             let field = self.parse_struct_field()?;
             fields.push(field);
         }
-    
+
         // 4) expect '}'
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
             return Err("Missing '}' at end of struct definition".to_string());
         }
-    
+
         // ここでASTノードを返す
         // 構造体を表すAstNodeを追加するなり、VarDeclのようなものを使うなり好きに
         Ok(AstNode::StructDef {
@@ -1210,7 +1308,7 @@ impl Parser {
             fields,
         })
     }
-    
+
     fn parse_struct_field(&mut self) -> Result<StructField, String> {
         self.skip_indent();
         // expect Identifier (フィールド名)
@@ -1222,27 +1320,30 @@ impl Parser {
             }
             ref other => return Err(format!("Expected field name, found {:?}", other)),
         };
-    
+
         // expect ':'
         if self.current_token() != Token::Colon {
-            return Err(format!("Expected ':' after field name, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected ':' after field name, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume ':'
-    
+
         // expect type => Identifier
         let field_type = self.parse_type()?;
-    
+
         // optional semicolon
         if self.current_token() == Token::Semicolon {
             self.advance();
         }
-    
+
         Ok(StructField {
             name: field_name,
             ty: field_type,
         })
     }
-    
+
     fn parse_decorators(&mut self) -> Result<Vec<Decorator>, String> {
         let mut result = Vec::new();
         loop {
@@ -1308,7 +1409,10 @@ impl Parser {
 
         // expect '{'
         if self.current_token() != Token::LBrace {
-            return Err(format!("Expected '{{' after class name, found {:?}", self.current_token()));
+            return Err(format!(
+                "Expected '{{' after class name, found {:?}",
+                self.current_token()
+            ));
         }
         self.advance(); // consume '{'
 
@@ -1338,7 +1442,13 @@ impl Parser {
     }
 
     /// 関数定義: def funcName(...) -> type { ... }
-    fn parse_function(&mut self, is_static: bool, is_private: bool, has_parent: bool, decorators: Vec<Decorator>) -> Result<AstNode, String> {
+    fn parse_function(
+        &mut self,
+        is_static: bool,
+        is_private: bool,
+        has_parent: bool,
+        decorators: Vec<Decorator>,
+    ) -> Result<AstNode, String> {
         // 関数名
         let func_name = match self.current_token() {
             Token::Identifier(ref s) => {
@@ -1458,7 +1568,12 @@ impl Parser {
     }
 
     /// 変数宣言: (final|let) name: type (= expr)? ;
-    fn parse_var_decl(&mut self, decl_token: Token, is_static: bool, is_private: bool) -> Result<AstNode, String> {
+    fn parse_var_decl(
+        &mut self,
+        decl_token: Token,
+        is_static: bool,
+        is_private: bool,
+    ) -> Result<AstNode, String> {
         let decl_type = match decl_token {
             Token::Final => VarDeclType::Final,
             Token::Let => VarDeclType::Let,
@@ -1563,7 +1678,7 @@ impl Parser {
             Token::Static => {
                 // consume 'static'
                 self.advance();
-    
+
                 // 次に来るトークンが何かで分岐
                 match self.current_token() {
                     // static let / static final => フィールド
@@ -1579,9 +1694,10 @@ impl Parser {
                         self.advance();
                         self.parse_function(true, false, false, decorators)
                     }
-                    ref other => {
-                        Err(format!("Expected 'let', 'final', or 'def' after 'static', found {:?}", other))
-                    }
+                    ref other => Err(format!(
+                        "Expected 'let', 'final', or 'def' after 'static', found {:?}",
+                        other
+                    )),
                 }
             }
             Token::Private => {
@@ -1599,14 +1715,15 @@ impl Parser {
                         self.advance();
                         self.parse_function(false, true, has_parent, decorators)
                     }
-                    ref other => {
-                        Err(format!("Expected 'let', 'final', or 'def' after 'private', found {:?}", other))
-                    }
+                    ref other => Err(format!(
+                        "Expected 'let', 'final', or 'def' after 'private', found {:?}",
+                        other
+                    )),
                 }
             }
             Token::Return => {
                 self.advance(); // consume 'return'
-                // return文の場合、式があるかもしれない
+                                // return文の場合、式があるかもしれない
                 if self.current_token() == Token::Semicolon {
                     // `return;`
                     self.advance();
@@ -1700,10 +1817,10 @@ impl Parser {
         }
         // 複合代入 (例: +=, -=, etc.)
         else if self.current_token() == Token::PlusEqual
-           || self.current_token() == Token::MinusEqual
-           || self.current_token() == Token::StarEqual
-           || self.current_token() == Token::SlashEqual
-           || self.current_token() == Token::PercentEqual
+            || self.current_token() == Token::MinusEqual
+            || self.current_token() == Token::StarEqual
+            || self.current_token() == Token::SlashEqual
+            || self.current_token() == Token::PercentEqual
         {
             let op = match self.current_token() {
                 Token::PlusEqual => BinOp::Plus,
@@ -1720,7 +1837,9 @@ impl Parser {
                 target: Box::new(lhs),
                 value: Box::new(rhs),
             });
-        } else if self.current_token() == Token::RangeHalfOpen || self.current_token() == Token::RangeClosed {
+        } else if self.current_token() == Token::RangeHalfOpen
+            || self.current_token() == Token::RangeClosed
+        {
             let op = match self.current_token() {
                 Token::RangeHalfOpen => BinOp::RangeHalfOpen,
                 Token::RangeClosed => BinOp::RangeClosed,
@@ -2012,15 +2131,9 @@ impl Parser {
                     vars: vec![],
                 }
             }
-            Token::LBracket => {
-                self.parse_array_literal()?
-            }
-            Token::LBrace => {
-                self.parse_dict_or_function_expr()?
-            }
-            Token::LParen => {
-                self.parse_paren_expr()?
-            }
+            Token::LBracket => self.parse_array_literal()?,
+            Token::LBrace => self.parse_dict_or_function_expr()?,
+            Token::LParen => self.parse_paren_expr()?,
             Token::Dot => {
                 self.advance();
                 match self.current_token() {
@@ -2097,7 +2210,7 @@ impl Parser {
     fn parse_paren_expr(&mut self) -> Result<Expr, String> {
         // 1) consume '('
         self.expect(&Token::LParen)?;
-    
+
         // 2) 判定: もし次がラムダパラメータ形式 (例: `x: uint32`) ならラムダ
         //          そうでなければ(または失敗すれば) タプル とみなす
         if self.check_if_lambda()? {
@@ -2111,23 +2224,23 @@ impl Parser {
 
     fn check_if_lambda(&mut self) -> Result<bool, String> {
         let saved_pos = self.pos;
-    
+
         // スキップ空白など
         self.skip_indent();
-    
+
         // もしすぐ ')' なら空タプル
         if self.current_token() == Token::RParen {
             self.pos = saved_pos;
             return Ok(false);
         }
-    
+
         // パターン: ( param1: Type, param2: Type ) => ...
         //           ( param1: Type, param2: Type ) { ... }
         // ただし param0 が無いラムダ "()" => ... は要件次第で対応可
-    
+
         // 先に "Identifier ':'" が並んでいるかチェック
         let mut saw_any_param = false;
-    
+
         loop {
             // expect Identifier
             match self.current_token() {
@@ -2140,7 +2253,7 @@ impl Parser {
                     return Ok(false);
                 }
             }
-    
+
             // expect ':'
             if self.current_token() != Token::Colon {
                 // これでラムダじゃない
@@ -2148,7 +2261,7 @@ impl Parser {
                 return Ok(false);
             }
             self.advance(); // consume ':'
-    
+
             // 型をざっくり読み飛ばす (1トークン～複数トークン?) → ここでは1トークンだけ確認にする例
             // 実際には parse_type() の先頭だけ覗き見するなどが必要
             match self.current_token() {
@@ -2161,9 +2274,9 @@ impl Parser {
                     return Ok(false);
                 }
             }
-    
+
             saw_any_param = true;
-    
+
             // カンマがあればパラメータ続行
             if self.current_token() == Token::Comma {
                 self.advance();
@@ -2172,17 +2285,17 @@ impl Parser {
                 break;
             }
         }
-    
+
         if !saw_any_param {
             // パラメータなし => lambda? 仕様に合わせる
             self.pos = saved_pos;
             return Ok(false);
         }
-    
+
         // 次が ')' で、その後 '=>' or '{' ならラムダ
         if self.current_token() == Token::RParen {
             self.advance(); // consume ')'
-    
+
             // ここで '=>' or '{' のどちらかを確認
             if self.current_token() == Token::FatArrow || self.current_token() == Token::LBrace {
                 // OK => lambda
@@ -2190,16 +2303,16 @@ impl Parser {
                 return Ok(true);
             }
         }
-    
+
         self.pos = saved_pos;
         Ok(false)
     }
 
     fn parse_lambda_expr(&mut self) -> Result<Expr, String> {
         // すでに '(' は消費済み in parse_paren_expr().
-    
+
         let mut params = Vec::new();
-    
+
         // parse param list
         loop {
             // expect Identifier
@@ -2208,15 +2321,15 @@ impl Parser {
                 ref other => return Err(format!("Expected param name, got {:?}", other)),
             };
             self.advance();
-    
+
             // expect ':'
             self.expect(&Token::Colon)?;
-    
+
             // parse type (簡易: ここで parse_type() 呼ぶなど)
             let param_type = self.parse_type()?;
             // ここでは固定サンプル; 実際は self.parse_type() する
             params.push((param_name, param_type));
-    
+
             // カンマがあればループ続行
             if self.current_token() == Token::Comma {
                 self.advance();
@@ -2225,15 +2338,15 @@ impl Parser {
                 break;
             }
         }
-    
+
         // expect ')'
         self.expect(&Token::RParen)?;
-    
+
         // 次が '=>' なら 短い式ラムダ
         if self.current_token() == Token::FatArrow {
             // `=>`
             self.advance(); // consume '=>'
-    
+
             // parse single expression
             let body_expr = self.parse_expr()?;
             Ok(Expr::Lambda {
@@ -2267,7 +2380,7 @@ impl Parser {
         // '(' は呼び出し元で consume済み
         // 要素が0個以上で、')' まで読み込む
         let mut elems = Vec::new();
-    
+
         // check if next is ')': empty tuple
         if self.current_token() == Token::RParen {
             // consume ')'
@@ -2275,25 +2388,25 @@ impl Parser {
             // 空タプル
             return Ok(Expr::TupleLiteral(elems));
         }
-    
+
         loop {
             // parse element as expression
             let elem = self.parse_expr()?;
             elems.push(elem);
-    
+
             // if comma => continue
             if self.current_token() == Token::Comma {
                 self.advance(); // consume ','
                 continue;
             }
-    
+
             // else => break
             break;
         }
-    
+
         // expect ')'
         self.expect(&Token::RParen)?;
-    
+
         if elems.len() == 1 {
             // 要素が1つならタプルではなくその要素そのもの
             return Ok(elems.remove(0));
@@ -2321,10 +2434,10 @@ impl Parser {
 
     fn parse_dict_literal_body(&mut self) -> Result<Expr, String> {
         let mut pairs = Vec::new();
-    
+
         loop {
             self.skip_indent();
-    
+
             // もし次が '}' なら辞書終了
             if self.current_token() == Token::RBrace {
                 // consume '}'
@@ -2332,7 +2445,7 @@ impl Parser {
                 // 生成して返す
                 return Ok(Expr::DictLiteral(pairs));
             }
-    
+
             // parse key
             // 例:  "test" : <expr>  or  identifier : <expr>
             let key_expr = match self.current_token() {
@@ -2354,22 +2467,28 @@ impl Parser {
                 }
                 // 他はエラー
                 ref other => {
-                    return Err(format!("Expected string literal or identifier as dict key, found {:?}", other));
+                    return Err(format!(
+                        "Expected string literal or identifier as dict key, found {:?}",
+                        other
+                    ));
                 }
             };
-    
+
             // expect ':'
             if self.current_token() != Token::Colon {
-                return Err(format!("Expected ':' after dict key, found {:?}", self.current_token()));
+                return Err(format!(
+                    "Expected ':' after dict key, found {:?}",
+                    self.current_token()
+                ));
             }
             self.advance(); // consume ':'
-    
+
             // parse value
             let value_expr = self.parse_expr()?;
-    
+
             // push to pairs
             pairs.push((key_expr, value_expr));
-    
+
             // optional comma
             if self.current_token() == Token::Comma {
                 self.advance(); // consume ','
@@ -2391,13 +2510,16 @@ impl Parser {
                 Token::Identifier(ref s) => {
                     let param_name = s.clone();
                     self.advance(); // consume identifier
-                    // 型指定は無いと仮定 / param_type = Something
-                    // 例: ("param1", VarTypeField { name="Any" ... })
-                    params.push((param_name, VarTypeField {
-                        name: "Any".to_string(),
-                        is_optional: false,
-                        args: vec![]
-                    }));
+                                    // 型指定は無いと仮定 / param_type = Something
+                                    // 例: ("param1", VarTypeField { name="Any" ... })
+                    params.push((
+                        param_name,
+                        VarTypeField {
+                            name: "Any".to_string(),
+                            is_optional: false,
+                            args: vec![],
+                        },
+                    ));
                 }
                 Token::Comma => {
                     self.advance(); // consume ','
@@ -2412,7 +2534,7 @@ impl Parser {
                 }
             }
         }
-    
+
         // parse statements until '}'
         let mut body_stmts = Vec::new();
         loop {
@@ -2421,17 +2543,17 @@ impl Parser {
                 break;
             }
             // ここはお使いの parse_statement() などを再利用
-            let stmt = self.parse_statement(false)?; 
+            let stmt = self.parse_statement(false)?;
             body_stmts.push(stmt);
         }
-    
+
         // expect '}'
         if self.current_token() == Token::RBrace {
             self.advance();
         } else {
             return Err("Missing '}' at end of closure body".to_string());
         }
-    
+
         // 3) 関数リテラル作成
         // 今回は return_type=None, body=body_stmts
         Ok(Expr::Function {
@@ -2503,7 +2625,7 @@ impl Parser {
         loop {
             if self.current_token() == Token::Comma {
                 self.advance(); // consume ','
-                // expect Identifier
+                                // expect Identifier
                 if let Token::Identifier(_) = self.current_token() {
                     self.advance();
                 } else {
@@ -2558,7 +2680,7 @@ impl Parser {
         } else {
             return Err("Expected '(' in call expression".to_string());
         }
-    
+
         let mut args = Vec::new();
         while self.current_token() != Token::RParen && self.current_token() != Token::Eof {
             let arg_expr = self.parse_expr()?;
@@ -2569,14 +2691,14 @@ impl Parser {
                 break;
             }
         }
-    
+
         // expect ')'
         if self.current_token() == Token::RParen {
             self.advance();
         } else {
             return Err("Missing ')' in function call".to_string());
         }
-    
+
         // return a Call node
         Ok(Expr::Call {
             callee: Box::new(callee_expr),
@@ -2587,13 +2709,13 @@ impl Parser {
     fn parse_index_expr(&mut self, base_expr: Expr) -> Result<Expr, String> {
         // expect '['
         self.expect(&Token::LBracket)?;
-    
+
         // parse the index expression (example: `i`, or `i + 1`, or function call, etc.)
-        let index_expr = self.parse_expr()?;  
-    
+        let index_expr = self.parse_expr()?;
+
         // expect ']'
         self.expect(&Token::RBracket)?;
-    
+
         Ok(Expr::Index {
             target: Box::new(base_expr),
             index: Box::new(index_expr),
@@ -2603,16 +2725,16 @@ impl Parser {
     fn parse_array_literal(&mut self) -> Result<Expr, String> {
         // consume '['
         self.expect(&Token::LBracket)?;
-    
+
         let mut elements = Vec::new();
-    
+
         // チェック: 空配列かもしれない → next が ']' なら空
         if self.current_token() != Token::RBracket {
             loop {
                 // parse_expr() で要素を読む
                 let elem = self.parse_expr()?;
                 elements.push(elem);
-    
+
                 // 次が ',' なら読み続ける
                 if self.current_token() == Token::Comma {
                     self.advance(); // consume ','
@@ -2621,10 +2743,10 @@ impl Parser {
                 }
             }
         }
-    
+
         // expect ']'
         self.expect(&Token::RBracket)?;
-    
+
         Ok(Expr::ArrayLiteral(elements))
     }
 
@@ -2633,7 +2755,7 @@ impl Parser {
         if self.pos >= self.tokens.len() {
             Token::Eof
         } else {
-            self.tokens[self.pos].clone()
+            self.tokens[self.pos].token.clone()
         }
     }
 
@@ -2643,14 +2765,22 @@ impl Parser {
         if idx >= self.tokens.len() {
             Token::Eof
         } else {
-            self.tokens[idx].clone()
+            self.tokens[idx].token.clone()
         }
+    }
+
+    fn current_span(&self) -> Option<Span> {
+        self.tokens.get(self.pos).map(|tok| tok.span)
+    }
+
+    fn peek_span(&self, n: usize) -> Option<Span> {
+        self.tokens.get(self.pos + n).map(|tok| tok.span)
     }
 
     fn peek_non_indent_token(&self, n: usize) -> Token {
         let mut idx = self.pos + n;
         while idx < self.tokens.len() {
-            match &self.tokens[idx] {
+            match &self.tokens[idx].token {
                 Token::Indent(_) => idx += 1,
                 Token::Newline => idx += 1,
                 token => return token.clone(),
