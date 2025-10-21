@@ -148,6 +148,8 @@ fn optimize_expr(expr: Expr) -> Expr {
             let right = optimize_expr(*right);
             if let Some(folded) = fold_binary(&left, &op, &right) {
                 folded
+            } else if let Some(simplified) = simplify_binary(&left, &op, &right) {
+                simplified
             } else {
                 Expr::Binary {
                     left: Box::new(left),
@@ -235,6 +237,250 @@ fn optimize_expr(expr: Expr) -> Expr {
     }
 }
 
+fn simplify_binary(left: &Expr, op: &BinOp, right: &Expr) -> Option<Expr> {
+    match op {
+        BinOp::Plus => simplify_addition(left, right),
+        BinOp::Star => simplify_multiplication(left, right),
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+enum AddTerm {
+    Expr(Expr),
+    Int(i64),
+    Float(f64),
+}
+
+fn collect_add_terms(expr: &Expr, terms: &mut Vec<AddTerm>) {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinOp::Plus,
+            right,
+        } => {
+            collect_add_terms(left, terms);
+            collect_add_terms(right, terms);
+        }
+        Expr::IntLiteral(value) => terms.push(AddTerm::Int(*value)),
+        Expr::FloatLiteral(value) => terms.push(AddTerm::Float(*value)),
+        other => terms.push(AddTerm::Expr(other.clone())),
+    }
+}
+
+fn simplify_addition(left: &Expr, right: &Expr) -> Option<Expr> {
+    let mut terms = Vec::new();
+    collect_add_terms(left, &mut terms);
+    collect_add_terms(right, &mut terms);
+
+    let mut int_sum: i64 = 0;
+    let mut has_int = false;
+    let mut float_sum: f64 = 0.0;
+    let mut has_float = false;
+    let mut constant_count = 0;
+    for term in &terms {
+        match term {
+            AddTerm::Int(value) => {
+                constant_count += 1;
+                has_int = true;
+                int_sum = int_sum.checked_add(*value)?;
+            }
+            AddTerm::Float(value) => {
+                constant_count += 1;
+                has_float = true;
+                float_sum += *value;
+            }
+            AddTerm::Expr(_) => {}
+        }
+    }
+
+    if constant_count == 0 {
+        return None;
+    }
+
+    let has_non_constant = terms.iter().any(|term| matches!(term, AddTerm::Expr(_)));
+    let mut constant_expr = if has_float {
+        let total = float_sum + if has_int { int_sum as f64 } else { 0.0 };
+        if total == 0.0 && has_non_constant {
+            None
+        } else {
+            Some(Expr::FloatLiteral(total))
+        }
+    } else {
+        if int_sum == 0 && has_non_constant {
+            None
+        } else {
+            Some(Expr::IntLiteral(int_sum))
+        }
+    };
+
+    let mut changed = constant_count > 1;
+    if constant_expr.is_none() {
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let mut result_terms: Vec<Expr> = Vec::new();
+    let mut constant_inserted = false;
+    for term in terms {
+        match term {
+            AddTerm::Expr(expr) => result_terms.push(expr),
+            AddTerm::Int(_) | AddTerm::Float(_) => {
+                if !constant_inserted {
+                    if let Some(expr) = constant_expr.take() {
+                        result_terms.push(expr);
+                        constant_inserted = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !constant_inserted {
+        if let Some(expr) = constant_expr.take() {
+            result_terms.push(expr);
+        }
+    }
+
+    if result_terms.is_empty() {
+        return Some(Expr::IntLiteral(0));
+    }
+
+    let mut iter = result_terms.into_iter();
+    let mut result = iter.next().unwrap();
+    for term in iter {
+        result = Expr::Binary {
+            left: Box::new(result),
+            op: BinOp::Plus,
+            right: Box::new(term),
+        };
+    }
+
+    Some(result)
+}
+
+#[derive(Clone)]
+enum MulFactor {
+    Expr(Expr),
+    Int(i64),
+    Float(f64),
+}
+
+fn collect_mul_factors(expr: &Expr, factors: &mut Vec<MulFactor>) {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinOp::Star,
+            right,
+        } => {
+            collect_mul_factors(left, factors);
+            collect_mul_factors(right, factors);
+        }
+        Expr::IntLiteral(value) => factors.push(MulFactor::Int(*value)),
+        Expr::FloatLiteral(value) => factors.push(MulFactor::Float(*value)),
+        other => factors.push(MulFactor::Expr(other.clone())),
+    }
+}
+
+fn simplify_multiplication(left: &Expr, right: &Expr) -> Option<Expr> {
+    let mut factors = Vec::new();
+    collect_mul_factors(left, &mut factors);
+    collect_mul_factors(right, &mut factors);
+
+    let mut int_product: i64 = 1;
+    let mut has_int = false;
+    let mut float_product: f64 = 1.0;
+    let mut has_float = false;
+    let mut constant_count = 0;
+    for factor in &factors {
+        match factor {
+            MulFactor::Int(value) => {
+                constant_count += 1;
+                has_int = true;
+                int_product = int_product.checked_mul(*value)?;
+            }
+            MulFactor::Float(value) => {
+                constant_count += 1;
+                has_float = true;
+                float_product *= *value;
+            }
+            MulFactor::Expr(_) => {}
+        }
+    }
+
+    if constant_count == 0 {
+        return None;
+    }
+
+    let has_non_constant = factors
+        .iter()
+        .any(|factor| matches!(factor, MulFactor::Expr(_)));
+    let mut constant_expr = if has_float {
+        let total = float_product * if has_int { int_product as f64 } else { 1.0 };
+        if total == 1.0 && has_non_constant {
+            None
+        } else {
+            Some(Expr::FloatLiteral(total))
+        }
+    } else {
+        if int_product == 1 && has_non_constant {
+            None
+        } else {
+            Some(Expr::IntLiteral(int_product))
+        }
+    };
+
+    let mut changed = constant_count > 1;
+    if constant_expr.is_none() {
+        changed = true;
+    }
+
+    if !changed {
+        return None;
+    }
+
+    let mut result_factors: Vec<Expr> = Vec::new();
+    let mut constant_inserted = false;
+    for factor in factors {
+        match factor {
+            MulFactor::Expr(expr) => result_factors.push(expr),
+            MulFactor::Int(_) | MulFactor::Float(_) => {
+                if !constant_inserted {
+                    if let Some(expr) = constant_expr.take() {
+                        result_factors.push(expr);
+                        constant_inserted = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !constant_inserted {
+        if let Some(expr) = constant_expr.take() {
+            result_factors.push(expr);
+        }
+    }
+
+    if result_factors.is_empty() {
+        return Some(Expr::IntLiteral(1));
+    }
+
+    let mut iter = result_factors.into_iter();
+    let mut result = iter.next().unwrap();
+    for factor in iter {
+        result = Expr::Binary {
+            left: Box::new(result),
+            op: BinOp::Star,
+            right: Box::new(factor),
+        };
+    }
+
+    Some(result)
+}
+
 fn fold_binary(left: &Expr, op: &BinOp, right: &Expr) -> Option<Expr> {
     match (left, right) {
         (Expr::IntLiteral(lv), Expr::IntLiteral(rv)) => fold_ints(*lv, op, *rv),
@@ -250,6 +496,18 @@ fn fold_ints(left: i64, op: &BinOp, right: i64) -> Option<Expr> {
         BinOp::Plus => left.checked_add(right).map(Expr::IntLiteral),
         BinOp::Minus => left.checked_sub(right).map(Expr::IntLiteral),
         BinOp::Star => left.checked_mul(right).map(Expr::IntLiteral),
+        BinOp::Slash => {
+            if right == 0 {
+                None
+            } else {
+                let (quotient, remainder) = (left / right, left % right);
+                if remainder == 0 {
+                    Some(Expr::IntLiteral(quotient))
+                } else {
+                    None
+                }
+            }
+        }
         BinOp::Percent => {
             if right == 0 {
                 None
