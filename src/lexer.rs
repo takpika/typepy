@@ -369,18 +369,17 @@ impl<'a> Lexer<'a> {
                 return Token::Amp;
             }
             '.' => {
-                if self.peek_char(1) == '.' && self.peek_char(2) == '.' {
-                    self.advance(); // 1文字目 '.' は既にここで消費
-                    self.advance(); // 2文字目 '.'
-                    self.advance(); // 3文字目 '.'
-                    return Token::RangeClosed; // "..."
-                } else if self.peek_char(1) == '.' && self.peek_char(2) == '<' {
-                    self.advance(); // 1文字目 '.' は既にここで消費
-                    self.advance(); // 2文字目 '.'
-                    self.advance(); // 3文字目 '<'
-                    // Swiftだと "..<" は 1個目の '.' + 2個目の '.' + '<'
-                    // => half-open range 
-                    return Token::RangeHalfOpen; // "..<"
+                if self.peek_char(1) == '.' && self.peek_char(2) == '<' {
+                    // "..<" (half-open range)
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    return Token::RangeHalfOpen;
+                } else if self.peek_char(1) == '.' {
+                    // ".." (closed range)
+                    self.advance();
+                    self.advance();
+                    return Token::RangeClosed;
                 } else {
                     self.advance();
                     return Token::Dot;

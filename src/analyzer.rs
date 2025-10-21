@@ -1,343 +1,1255 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::parser::AstNode;
 use crate::parser::BinOp;
+use crate::parser::CatchBlock;
+use crate::parser::Decorator;
 use crate::parser::Expr;
+use crate::parser::LambdaBody;
+use crate::parser::SwitchCase;
 use crate::parser::VarDeclType;
 use crate::parser::VarTypeField;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Symbol {
-    pub name: String,
-    pub var_type: VarTypeField,
-    pub read_only: bool,
-    pub children: HashMap<String, Symbol>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Type {
+    Any,
+    Unknown,
+    None,
+    Named(String),
+    Array(Box<Type>),
+    Dict(Box<Type>, Box<Type>),
+    Tuple(Vec<Type>),
+    Function(Vec<Type>, Box<Type>),
+    Union(Vec<Type>),
+    Optional(Box<Type>),
+    IntLiteral,
+    FloatLiteral,
+    TypeObject(String),
+    Range(Box<Type>),
 }
 
-pub struct Analyzer {
-    pub root_node: AstNode,
+impl Type {
+    fn optional(inner: Type) -> Type {
+        Type::Optional(Box::new(inner))
+    }
+
+    fn union(types: Vec<Type>) -> Type {
+        let mut flat: Vec<Type> = Vec::new();
+        for ty in types {
+            match ty {
+                Type::Union(items) => {
+                    for item in items {
+                        if !flat.contains(&item) {
+                            flat.push(item);
+                        }
+                    }
+                }
+                other => {
+                    if !flat.contains(&other) {
+                        flat.push(other);
+                    }
+                }
+            }
+        }
+        if flat.len() == 1 {
+            flat.into_iter().next().unwrap()
+        } else {
+            Type::Union(flat)
+        }
+    }
+
+    fn unwrap_optional(&self) -> Option<Type> {
+        match self {
+            Type::Optional(inner) => Some((**inner).clone()),
+            _ => None,
+        }
+    }
+
+    fn is_optional(&self) -> bool {
+        matches!(self, Type::Optional(_))
+    }
+
+    fn as_function(&self) -> Option<(Vec<Type>, Type)> {
+        match self {
+            Type::Function(params, ret) => Some((params.clone(), (*ret.clone()))),
+            _ => None,
+        }
+    }
+
+    fn normalize_name(name: &str) -> String {
+        match name {
+            "str" => "string".to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionInfo {
+    pub params: Vec<Type>,
+    pub return_type: Type,
+    pub is_method: bool,
+    pub is_static: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassInfo {
+    pub name: String,
+    pub instance_fields: HashMap<String, Type>,
+    pub static_fields: HashMap<String, Type>,
+    pub instance_methods: HashMap<String, FunctionInfo>,
+    pub static_methods: HashMap<String, FunctionInfo>,
+    pub constructor: Option<FunctionInfo>,
+}
+
+impl ClassInfo {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            instance_fields: HashMap::new(),
+            static_fields: HashMap::new(),
+            instance_methods: HashMap::new(),
+            static_methods: HashMap::new(),
+            constructor: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StructInfo {
+    pub name: String,
+    pub fields: Vec<(String, Type)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumInfo {
+    pub name: String,
+    pub variants: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeInfo {
+    Primitive,
+    Class(ClassInfo),
+    Struct(StructInfo),
+    Enum(EnumInfo),
+}
+
+#[derive(Debug, Clone)]
+pub enum SymbolValue {
+    Variable { ty: Type, mutable: bool },
+    Function(FunctionInfo),
+    TypeName(String),
+    EnumVariant { parent: String },
+    Module(HashMap<String, SymbolValue>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Symbol {
+    pub name: String,
+    pub value: SymbolValue,
 }
 
 #[derive(Debug)]
 pub enum AnalyzerError {
     AlreadyDefined(String),
     NotDefined(String),
-    NotImplemented,
-    NotType(String),
-    NotFunction(String),
-    FailedToDetermineType,
-    TypeNotMatched {
-        left: String,
-        right: String,
-    },
+    InvalidOperation(String),
+}
+
+struct AnalyzerContext {
+    scopes: Vec<HashMap<String, Symbol>>,
+    types: HashMap<String, TypeInfo>,
+    enum_variants: HashMap<String, String>,
+    current_return: Vec<Option<Type>>,
+}
+
+impl AnalyzerContext {
+    fn new() -> Self {
+        Self {
+            scopes: vec![HashMap::new()],
+            types: HashMap::new(),
+            enum_variants: HashMap::new(),
+            current_return: Vec::new(),
+        }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn declare(&mut self, symbol: Symbol) -> Result<(), AnalyzerError> {
+        let scope = self.scopes.last_mut().unwrap();
+        if scope.contains_key(&symbol.name) {
+            return Err(AnalyzerError::AlreadyDefined(symbol.name));
+        }
+        scope.insert(symbol.name.clone(), symbol);
+        Ok(())
+    }
+
+    fn redeclare(&mut self, symbol: Symbol) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(symbol.name.clone(), symbol);
+        }
+    }
+
+    fn assign(&mut self, name: &str, ty: Type) -> Result<(), AnalyzerError> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(symbol) = scope.get_mut(name) {
+                match &mut symbol.value {
+                    SymbolValue::Variable { ty: existing, mutable } => {
+                        if !*mutable {
+                            return Err(AnalyzerError::InvalidOperation(format!(
+                                "{} is immutable", name
+                            )));
+                        }
+                        *existing = ty;
+                        return Ok(());
+                    }
+                    _ => {
+                        return Err(AnalyzerError::InvalidOperation(format!(
+                            "{} is not a variable",
+                            name
+                        )));
+                    }
+                }
+            }
+        }
+        Err(AnalyzerError::NotDefined(name.to_string()))
+    }
+
+    fn lookup(&self, name: &str) -> Option<&Symbol> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(symbol) = scope.get(name) {
+                return Some(symbol);
+            }
+        }
+        None
+    }
+
+    fn get_type(&self, name: &str) -> Option<&TypeInfo> {
+        self.types.get(name)
+    }
+
+    fn insert_type(&mut self, name: String, info: TypeInfo) -> Result<(), AnalyzerError> {
+        if self.types.contains_key(&name) {
+            return Err(AnalyzerError::AlreadyDefined(name));
+        }
+        self.types.insert(name.clone(), info);
+        self.declare(Symbol {
+            name: name.clone(),
+            value: SymbolValue::TypeName(name),
+        })?;
+        Ok(())
+    }
+}
+
+pub struct Analyzer {
+    pub root_node: AstNode,
+    use_std: bool,
 }
 
 impl Analyzer {
     pub fn new(root_node: AstNode) -> Self {
-        Self { root_node }
+        Self {
+            root_node,
+            use_std: true,
+        }
     }
 
-    pub fn analyze(&mut self) -> Result<(), String> {
-        let mut symbols = HashMap::new();
-        match self.analyze_node(&self.root_node, &mut symbols) {
-            Ok(Some(symbol)) => {
-                symbols.insert(symbol.name.clone(), symbol);
+    pub fn with_std(root_node: AstNode, use_std: bool) -> Self {
+        Self { root_node, use_std }
+    }
+
+    pub fn set_use_std(&mut self, use_std: bool) {
+        self.use_std = use_std;
+    }
+
+    pub fn analyze(&self) -> Result<(), String> {
+        let mut ctx = AnalyzerContext::new();
+        if self.use_std {
+            self.install_std(&mut ctx);
+        }
+        match self.analyze_node(&self.root_node, &mut ctx) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("{:?}", e)),
+        }
+    }
+
+    fn analyze_node(&self, node: &AstNode, ctx: &mut AnalyzerContext) -> Result<(), AnalyzerError> {
+        match node {
+            AstNode::File(items) => {
+                for item in items {
+                    self.analyze_node(item, ctx)?;
+                }
+                Ok(())
             }
-            Ok(None) => {}
-            Err(e) => {
-                return Err(format!("{:?}", e));
+            AstNode::Import { module, names } => {
+                if let Some(module_name) = module {
+                    if let Some(std_module) = ctx
+                        .lookup(module_name)
+                        .and_then(|symbol| match &symbol.value {
+                            SymbolValue::Module(map) => Some(map.clone()),
+                            _ => None,
+                        })
+                    {
+                        for import in names {
+                            let key = import.as_name.clone().unwrap_or_else(|| import.name.clone());
+                            if let Some(value) = std_module.get(&import.name).cloned() {
+                                ctx.redeclare(Symbol { name: key, value });
+                            } else {
+                                ctx.redeclare(Symbol {
+                                    name: key,
+                                    value: SymbolValue::Module(HashMap::new()),
+                                });
+                            }
+                        }
+                        return Ok(());
+                    }
+                } else {
+                    for import in names {
+                        let alias = import.as_name.clone().unwrap_or_else(|| import.name.clone());
+                        if let Some(symbol) = ctx.lookup(&import.name) {
+                            match &symbol.value {
+                                SymbolValue::Module(map) => {
+                                    ctx.redeclare(Symbol {
+                                        name: alias,
+                                        value: SymbolValue::Module(map.clone()),
+                                    });
+                                }
+                                other => {
+                                    ctx.redeclare(Symbol {
+                                        name: alias,
+                                        value: other.clone(),
+                                    });
+                                }
+                            }
+                        } else {
+                            ctx.redeclare(Symbol {
+                                name: alias,
+                                value: SymbolValue::Module(HashMap::new()),
+                            });
+                        }
+                    }
+                    return Ok(());
+                }
+                for import in names {
+                    let key = import.as_name.clone().unwrap_or_else(|| import.name.clone());
+                    ctx.redeclare(Symbol {
+                        name: key,
+                        value: SymbolValue::Module(HashMap::new()),
+                    });
+                }
+                Ok(())
             }
+            AstNode::ClassDef { name, members, .. } => {
+                ctx.insert_type(name.clone(), TypeInfo::Class(ClassInfo::new(name)))?;
+                let mut info = ClassInfo::new(name);
+                for member in members {
+                    match member {
+                        AstNode::VarDecl {
+                            name: field_name,
+                            var_type,
+                            decl_type: _,
+                            expr,
+                            is_static,
+                            ..
+                        } => {
+                            let field_type = if let Some(var_ty) = var_type {
+                                self.type_from_field(var_ty)?
+                            } else if let Some(expr) = expr {
+                                self.type_from_expr(expr, ctx)?
+                            } else {
+                                Type::Unknown
+                            };
+                            if *is_static {
+                                info.static_fields.insert(field_name.clone(), field_type);
+                            } else {
+                                info.instance_fields.insert(field_name.clone(), field_type);
+                            }
+                        }
+                        AstNode::FunctionDef {
+                            name: fn_name,
+                            params,
+                            return_type,
+                            body,
+                            is_static,
+                            ..
+                        } => {
+                            let mut param_types = Vec::new();
+                            for (_, ty) in params {
+                                param_types.push(self.type_from_field(ty)?);
+                            }
+                            let ret_type = if let Some(ret) = return_type {
+                                self.type_from_field(ret)?
+                            } else {
+                                Type::None
+                            };
+                            ctx.push_scope();
+                            if !*is_static {
+                                ctx.declare(Symbol {
+                                    name: "self".to_string(),
+                                    value: SymbolValue::Variable {
+                                        ty: Type::Named(name.clone()),
+                                        mutable: true,
+                                    },
+                                })?;
+                            }
+                            for (index, (param_name, param_ty)) in params.iter().enumerate() {
+                                if !*is_static && index == 0 && param_name == "self" {
+                                    continue;
+                                }
+                                ctx.declare(Symbol {
+                                    name: param_name.clone(),
+                                    value: SymbolValue::Variable {
+                                        ty: self.type_from_field(param_ty)?,
+                                        mutable: true,
+                                    },
+                                })?;
+                            }
+                            ctx.current_return.push(Some(ret_type.clone()));
+                            for stmt in body {
+                                self.analyze_node(stmt, ctx)?;
+                            }
+                            ctx.current_return.pop();
+                            ctx.pop_scope();
+                            let fn_info = FunctionInfo {
+                                params: param_types,
+                                return_type: ret_type.clone(),
+                                is_method: !*is_static,
+                                is_static: *is_static,
+                            };
+                            if fn_name == "__init__" {
+                                info.constructor = Some(fn_info.clone());
+                            }
+                            if *is_static {
+                                info.static_methods.insert(fn_name.clone(), fn_info);
+                            } else {
+                                info.instance_methods.insert(fn_name.clone(), fn_info);
+                            }
+                        }
+                        AstNode::PassStmt => {}
+                        _ => {
+                            self.analyze_node(member, ctx)?;
+                        }
+                    }
+                    ctx.types.insert(name.clone(), TypeInfo::Class(info.clone()));
+                }
+                ctx.types.insert(name.clone(), TypeInfo::Class(info));
+                Ok(())
+            }
+            AstNode::StructDef { name, fields } => {
+                let mut struct_fields = Vec::new();
+                for field in fields {
+                    struct_fields.push((field.name.clone(), self.type_from_field(&field.ty)?));
+                }
+                let info = StructInfo {
+                    name: name.clone(),
+                    fields: struct_fields,
+                };
+                ctx.insert_type(name.clone(), TypeInfo::Struct(info))?;
+                Ok(())
+            }
+            AstNode::EnumDef { name, variants } => {
+                let mut info = EnumInfo {
+                    name: name.clone(),
+                    variants: HashSet::new(),
+                };
+                for variant in variants {
+                    info.variants.insert(variant.clone());
+                    ctx.enum_variants.insert(variant.clone(), name.clone());
+                }
+                ctx.insert_type(name.clone(), TypeInfo::Enum(info))?;
+                Ok(())
+            }
+            AstNode::FunctionDef {
+                name,
+                params,
+                return_type,
+                body,
+                decorators,
+                ..
+            } => {
+                let mut param_entries = Vec::new();
+                for (param_name, ty) in params {
+                    let param_ty = self.type_from_field(ty)?;
+                    param_entries.push((param_name.clone(), param_ty));
+                }
+                let param_types = param_entries.iter().map(|(_, ty)| ty.clone()).collect();
+                let ret_type = if let Some(ret) = return_type {
+                    self.type_from_field(ret)?
+                } else {
+                    Type::None
+                };
+                let fn_info = FunctionInfo {
+                    params: param_types,
+                    return_type: ret_type.clone(),
+                    is_method: false,
+                    is_static: false,
+                };
+                ctx.declare(Symbol {
+                    name: name.clone(),
+                    value: SymbolValue::Function(fn_info.clone()),
+                })?;
+                ctx.push_scope();
+                ctx.current_return.push(Some(ret_type));
+                for (param_name, param_ty) in &param_entries {
+                    ctx.declare(Symbol {
+                        name: param_name.clone(),
+                        value: SymbolValue::Variable {
+                            ty: param_ty.clone(),
+                            mutable: true,
+                        },
+                    })?;
+                }
+                for stmt in body {
+                    self.analyze_node(stmt, ctx)?;
+                }
+                ctx.current_return.pop();
+                ctx.pop_scope();
+                if !decorators.is_empty() {
+                    self.apply_decorators(name, decorators, false, false, ctx)?;
+                }
+                Ok(())
+            }
+            AstNode::VarDecl {
+                name,
+                var_type,
+                expr,
+                decl_type,
+                ..
+            } => {
+                let ty = if let Some(var_ty) = var_type {
+                    self.type_from_field(var_ty)?
+                } else if let Some(expr) = expr {
+                    self.type_from_expr(expr, ctx)?
+                } else {
+                    Type::Unknown
+                };
+                ctx.redeclare(Symbol {
+                    name: name.clone(),
+                    value: SymbolValue::Variable {
+                        ty,
+                        mutable: *decl_type == VarDeclType::Let,
+                    },
+                });
+                Ok(())
+            }
+            AstNode::ExprStmt(expr) => {
+                self.type_from_expr(expr, ctx)?;
+                Ok(())
+            }
+            AstNode::ReturnStmt(expr) => {
+                if let Some(expected) = ctx.current_return.last().cloned().flatten() {
+                    if let Some(value_expr) = expr {
+                        let _ty = self.type_from_expr(value_expr, ctx)?;
+                        let _ = expected;
+                    }
+                }
+                Ok(())
+            }
+            AstNode::SwitchStmt { expr, cases, default } => {
+                let switch_ty = self.type_from_expr(expr, ctx)?;
+                for case in cases {
+                    self.analyze_switch_case(case, &switch_ty, ctx)?;
+                }
+                if let Some(default_body) = default {
+                    ctx.push_scope();
+                    for stmt in default_body {
+                        self.analyze_node(stmt, ctx)?;
+                    }
+                    ctx.pop_scope();
+                }
+                Ok(())
+            }
+            AstNode::IfStmt { condition, body, else_body } => {
+                self.type_from_expr(condition, ctx)?;
+                ctx.push_scope();
+                for stmt in body {
+                    self.analyze_node(stmt, ctx)?;
+                }
+                ctx.pop_scope();
+                if let Some(else_block) = else_body {
+                    ctx.push_scope();
+                    for stmt in else_block {
+                        self.analyze_node(stmt, ctx)?;
+                    }
+                    ctx.pop_scope();
+                }
+                Ok(())
+            }
+            AstNode::GuardStmt { condition, else_body } => {
+                match condition.as_ref() {
+                    Expr::VarDecl { name, expr, .. } => {
+                        let condition_ty = self.type_from_expr(expr, ctx)?;
+                        if let Some(inner) = condition_ty.unwrap_optional() {
+                            ctx.redeclare(Symbol {
+                                name: name.clone(),
+                                value: SymbolValue::Variable {
+                                    ty: inner,
+                                    mutable: false,
+                                },
+                            });
+                        }
+                    }
+                    other => {
+                        self.type_from_expr(other, ctx)?;
+                    }
+                }
+                if let Some(else_block) = else_body {
+                    ctx.push_scope();
+                    for stmt in else_block {
+                        self.analyze_node(stmt, ctx)?;
+                    }
+                    ctx.pop_scope();
+                }
+                Ok(())
+            }
+            AstNode::ForStmt { var_name, iterable, body } => {
+                let iter_ty = self.type_from_expr(iterable, ctx)?;
+                ctx.push_scope();
+                ctx.declare(Symbol {
+                    name: var_name.clone(),
+                    value: SymbolValue::Variable {
+                        ty: match iter_ty {
+                            Type::Array(inner) => (*inner).clone(),
+                            Type::Range(inner) => (*inner).clone(),
+                            _ => Type::Unknown,
+                        },
+                        mutable: true,
+                    },
+                })?;
+                for stmt in body {
+                    self.analyze_node(stmt, ctx)?;
+                }
+                ctx.pop_scope();
+                Ok(())
+            }
+            AstNode::TryStmt { body, catch_blocks, finally_block } => {
+                ctx.push_scope();
+                for stmt in body {
+                    self.analyze_node(stmt, ctx)?;
+                }
+                ctx.pop_scope();
+                for catch in catch_blocks {
+                    self.analyze_catch_block(catch, ctx)?;
+                }
+                if let Some(finally_body) = finally_block {
+                    ctx.push_scope();
+                    for stmt in finally_body {
+                        self.analyze_node(stmt, ctx)?;
+                    }
+                    ctx.pop_scope();
+                }
+                Ok(())
+            }
+            AstNode::ThrowStmt(expr) => {
+                self.type_from_expr(expr, ctx)?;
+                Ok(())
+            }
+            AstNode::PassStmt => Ok(()),
+            AstNode::BreakStmt => Ok(()),
+            AstNode::ContinueStmt => Ok(()),
+        }
+    }
+
+    fn apply_decorators(
+        &self,
+        function_name: &str,
+        decorators: &[Decorator],
+        is_method: bool,
+        is_static: bool,
+        ctx: &mut AnalyzerContext,
+    ) -> Result<(), AnalyzerError> {
+        for decorator in decorators.iter().rev() {
+            let callee_expr = self.decorator_to_expr(&decorator.name);
+            let decorator_call = if decorator.args.is_empty() {
+                callee_expr
+            } else {
+                Expr::Call {
+                    callee: Box::new(callee_expr),
+                    args: decorator.args.clone(),
+                }
+            };
+            let call_expr = Expr::Call {
+                callee: Box::new(decorator_call),
+                args: vec![Expr::Identifier(function_name.to_string())],
+            };
+            let ty = self.type_from_expr(&call_expr, ctx)?;
+            let value = match ty {
+                Type::Function(params, ret) => SymbolValue::Function(FunctionInfo {
+                    params,
+                    return_type: *ret,
+                    is_method,
+                    is_static,
+                }),
+                other => SymbolValue::Variable {
+                    ty: other,
+                    mutable: false,
+                },
+            };
+            ctx.redeclare(Symbol {
+                name: function_name.to_string(),
+                value,
+            });
         }
         Ok(())
     }
 
-    fn analyze_node(&self, node: &AstNode, symbols: &mut HashMap<String, Symbol>) -> Result<Option<Symbol>, AnalyzerError> {
-        let mut this_symbols = symbols.clone();
-        match node {
-            AstNode::File(nodes) => {
-                for n in nodes {
-                    match self.analyze_node(n, &mut this_symbols) {
-                        Ok(Some(symbol)) => {
-                            if this_symbols.contains_key(&symbol.name) {
-                                return Err(AnalyzerError::AlreadyDefined(symbol.name));
-                            }
-                            this_symbols.insert(symbol.name.clone(), symbol);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    }
-                }
-                Ok(None)
-            },
-            AstNode::ClassDef { name, members, parents } => {
-                let mut children_symbols = HashMap::new();
-                for m in members {
-                    match self.analyze_node(m, &mut this_symbols) {
-                        Ok(Some(symbol)) => {
-                            let symbol_name = symbol.name.clone();
-                            if this_symbols.contains_key(&symbol_name) {
-                                return Err(AnalyzerError::AlreadyDefined(symbol_name));
-                            }
-                            this_symbols.insert(symbol_name.clone(), symbol.clone());
-                            children_symbols.insert(symbol_name, symbol);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    }
-                }
-                Ok(Some(Symbol {
-                    name: name.clone(),
-                    var_type: VarTypeField {
-                        name: "class".to_string(),
-                        is_optional: false,
-                        args: vec![],
-                    },
-                    read_only: false,
-                    children: children_symbols,
-                }))
-            }
-            AstNode::StructDef { name, fields } => {
-                let mut children_symbols = HashMap::new();
-                for field in fields {
-                    self.check_type(&field.ty, symbols);
-                    let symbol = Symbol {
-                        name: field.name.clone(),
-                        var_type: field.ty.clone(),
-                        read_only: false,
-                        children: HashMap::new(),
-                    };
-                    if children_symbols.contains_key(&symbol.name) {
-                        return Err(AnalyzerError::AlreadyDefined(symbol.name));
-                    }
-                    children_symbols.insert(symbol.name.clone(), symbol);
-                }
-                Ok(Some(Symbol {
-                    name: name.clone(),
-                    var_type: VarTypeField {
-                        name: "struct".to_string(),
-                        is_optional: false,
-                        args: vec![],
-                    },
-                    read_only: false,
-                    children: children_symbols,
-                }))
-            }
-            AstNode::EnumDef { name, variants } => {
-                let mut children_symbols = HashMap::new();
-                for v in variants {
-                    let symbol = Symbol {
-                        name: v.clone(),
-                        var_type: VarTypeField {
-                            name: "enum_variant".to_string(),
-                            is_optional: false,
-                            args: vec![],
-                        },
-                        read_only: true,
-                        children: HashMap::new(),
-                    };
-                    if children_symbols.contains_key(&symbol.name) {
-                        return Err(AnalyzerError::AlreadyDefined(symbol.name));
-                    }
-                    children_symbols.insert(symbol.name.clone(), symbol);
-                }
-                Ok(Some(Symbol {
-                    name: name.clone(),
-                    var_type: VarTypeField {
-                        name: "enum".to_string(),
-                        is_optional: false,
-                        args: vec![],
-                    },
-                    read_only: false,
-                    children: children_symbols,
-                }))
-            }
-            AstNode::FunctionDef { name, params, return_type, body, is_static, is_private, decorators } => {
-                let mut type_args = vec![];
-                for param in params {
-                    let var_type = param.1.clone();
-                    self.check_type(&var_type, &this_symbols)?;
-                    type_args.push(var_type);
-                }
-                let return_type = return_type.as_ref().unwrap();
-                self.check_type(return_type, &this_symbols)?;
-                type_args.push(return_type.clone());
-                for b in body {
-                    match self.analyze_node(b, &mut this_symbols) {
-                        Ok(Some(symbol)) => {
-                            let symbol_name = symbol.name.clone();
-                            if this_symbols.contains_key(&symbol_name) {
-                                return Err(AnalyzerError::AlreadyDefined(symbol_name));
-                            }
-                            this_symbols.insert(symbol_name.clone(), symbol.clone());
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    };
-                }
-                Ok(Some(Symbol {
-                    name: name.clone(),
-                    var_type: VarTypeField {
-                        name: "function".to_string(),
-                        is_optional: false,
-                        args: type_args,
-                    },
-                    read_only: false,
-                    children: HashMap::new(),
-                }))
-            }
-            AstNode::VarDecl { name, var_type, decl_type, expr, is_static, is_private } => {
-                let ty = if var_type.is_none() {
-                    self.determine_type(expr.as_ref().unwrap())?
-                } else {
-                    var_type.as_ref().unwrap().clone()
+    fn decorator_to_expr(&self, name: &str) -> Expr {
+        let mut parts = name.split('.');
+        if let Some(first) = parts.next() {
+            let mut expr = Expr::Identifier(first.to_string());
+            for part in parts {
+                expr = Expr::MemberAccess {
+                    target: Some(Box::new(expr)),
+                    member: part.to_string(),
                 };
-                self.check_type(&ty, &this_symbols)?;
-                Ok(Some(Symbol {
-                    name: name.clone(),
-                    var_type: ty,
-                    read_only: *decl_type != VarDeclType::Let,
-                    children: HashMap::new(),
-                }))
             }
-            AstNode::Import { module, names } => {
-                Ok(None)
-            }
-            _ => {
-                return Err(AnalyzerError::NotImplemented);
-            }
+            expr
+        } else {
+            Expr::Identifier(name.to_string())
         }
     }
 
-    fn check_type(&self, var_type: &VarTypeField, symbols: &HashMap<String, Symbol>) -> Result<(), AnalyzerError> {
-        const BUILTIN_TYPES: [&str; 12] = ["int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float32", "float64", "string", "bool"];
-        if BUILTIN_TYPES.contains(&var_type.name.as_str()) {
-            return Ok(());
-        }
-        if let Some(symbol) = symbols.get(&var_type.name) {
-            match symbol.var_type.name.as_str() {
-                "class" | "struct" | "enum" => {
-                    return Ok(());
-                }
-                _ => {
-                    return Err(AnalyzerError::NotType(var_type.name.clone()));
+    fn analyze_switch_case(
+        &self,
+        case: &SwitchCase,
+        switch_ty: &Type,
+        ctx: &mut AnalyzerContext,
+    ) -> Result<(), AnalyzerError> {
+        ctx.push_scope();
+        if let Type::Named(enum_name) = switch_ty {
+            if let Some(TypeInfo::Enum(enum_info)) = ctx.get_type(enum_name) {
+                if !enum_info.variants.contains(&case.pattern) {
+                    return Err(AnalyzerError::NotDefined(case.pattern.clone()));
                 }
             }
         }
-        Err(AnalyzerError::NotDefined(var_type.name.clone()))
+        for stmt in &case.body {
+            self.analyze_node(stmt, ctx)?;
+        }
+        ctx.pop_scope();
+        Ok(())
     }
 
-    fn determine_type(&self, expr: &Expr) -> Result<VarTypeField, AnalyzerError> {
+    fn analyze_catch_block(
+        &self,
+        catch: &CatchBlock,
+        ctx: &mut AnalyzerContext,
+    ) -> Result<(), AnalyzerError> {
+        ctx.push_scope();
+        if let Some(name) = &catch.exception_name {
+            ctx.declare(Symbol {
+                name: name.clone(),
+                value: SymbolValue::Variable {
+                    ty: Type::Unknown,
+                    mutable: true,
+                },
+            })?;
+        }
+        for stmt in &catch.body {
+            self.analyze_node(stmt, ctx)?;
+        }
+        ctx.pop_scope();
+        Ok(())
+    }
+
+    fn type_from_field(&self, field: &VarTypeField) -> Result<Type, AnalyzerError> {
+        let base = match field.name.as_str() {
+            "array" => {
+                let inner = self.type_from_field(&field.args[0])?;
+                Type::Array(Box::new(inner))
+            }
+            "dict" => {
+                let key = self.type_from_field(&field.args[0])?;
+                let value = self.type_from_field(&field.args[1])?;
+                Type::Dict(Box::new(key), Box::new(value))
+            }
+            "tuple" => {
+                let mut items = Vec::new();
+                for arg in &field.args {
+                    items.push(self.type_from_field(arg)?);
+                }
+                Type::Tuple(items)
+            }
+            "function" => {
+                let mut args = Vec::new();
+                for arg in &field.args[..field.args.len() - 1] {
+                    args.push(self.type_from_field(arg)?);
+                }
+                let ret = self.type_from_field(&field.args[field.args.len() - 1])?;
+                Type::Function(args, Box::new(ret))
+            }
+            "union" => {
+                let mut args = Vec::new();
+                for arg in &field.args {
+                    args.push(self.type_from_field(arg)?);
+                }
+                Type::union(args)
+            }
+            "None" => Type::None,
+            other => Type::Named(Type::normalize_name(other)),
+        };
+        if field.is_optional {
+            Ok(Type::optional(base))
+        } else {
+            Ok(base)
+        }
+    }
+
+    fn type_from_expr(&self, expr: &Expr, ctx: &mut AnalyzerContext) -> Result<Type, AnalyzerError> {
         match expr {
-            Expr::IntLiteral(_) => Ok(VarTypeField {
-                name: "int64".to_string(),
-                is_optional: false,
-                args: vec![],
-            }),
-            Expr::FloatLiteral(_) => Ok(VarTypeField {
-                name: "float64".to_string(),
-                is_optional: false,
-                args: vec![],
-            }),
-            Expr::StringLiteral { value, ty, vars } => Ok(VarTypeField {
-                name: "string".to_string(),
-                is_optional: false,
-                args: vec![],
-            }),
-            Expr::BoolLiteral(_) => Ok(VarTypeField {
-                name: "bool".to_string(),
-                is_optional: false,
-                args: vec![],
-            }),
-            Expr::Binary {left, op, right} => {
-                let left_type = self.determine_type(left)?;
-                let right_type = self.determine_type(right)?;
-                match op {
-                    BinOp::Plus | BinOp::Minus | BinOp::Star | BinOp::Slash | BinOp::Power => {
-                        if left_type.name == "int64" && right_type.name == "int64" {
-                            return Ok(VarTypeField {
-                                name: "int64".to_string(),
-                                is_optional: false,
-                                args: vec![],
-                            });
-                        }
-                        if left_type.name == "float64" && right_type.name == "float64" {
-                            return Ok(VarTypeField {
-                                name: "float64".to_string(),
-                                is_optional: false,
-                                args: vec![],
-                            });
-                        }
-                        if (left_type.name == "int64" && right_type.name == "float64") || (left_type.name == "float64" && right_type.name == "int64") {
-                            return Ok(VarTypeField {
-                                name: "float64".to_string(),
-                                is_optional: false,
-                                args: vec![],
-                            });
-                        }
-                        return Err(AnalyzerError::TypeNotMatched {
-                            left: left_type.name.clone(),
-                            right: right_type.name.clone(),
-                        });
-                    },
-                    BinOp::Percent => {
-                        if left_type.name == "int64" && right_type.name == "int64" {
-                            return Ok(VarTypeField {
-                                name: "int64".to_string(),
-                                is_optional: false,
-                                args: vec![],
-                            });
-                        }
-                        return Err(AnalyzerError::TypeNotMatched {
-                            left: left_type.name.clone(),
-                            right: right_type.name.clone(),
-                        });
+            Expr::Identifier(name) => {
+                if let Some(symbol) = ctx.lookup(name) {
+                    match &symbol.value {
+                        SymbolValue::Variable { ty, .. } => Ok(ty.clone()),
+                        SymbolValue::Function(info) => Ok(Type::Function(info.params.clone(), Box::new(info.return_type.clone()))),
+                        SymbolValue::TypeName(type_name) => Ok(Type::TypeObject(type_name.clone())),
+                        SymbolValue::EnumVariant { parent } => Ok(Type::Named(parent.clone())),
+                        SymbolValue::Module(_) => Ok(Type::Any),
                     }
-                    BinOp::Equal | BinOp::NotEqual => {
-                        Ok(VarTypeField {
-                            name: "bool".to_string(),
-                            is_optional: false,
-                            args: vec![],
-                        })
-                    }
-                    BinOp::LessThan | BinOp::LessThanOrEqual | BinOp::GreaterThan | BinOp::GreaterThanOrEqual => {
-                        if (left_type.name == "int64" || left_type.name == "float64") && (right_type.name == "int64" || right_type.name == "float64") {
-                            Ok(VarTypeField {
-                                name: "bool".to_string(),
-                                is_optional: false,
-                                args: vec![],
-                            })
-                        } else {
-                            Err(AnalyzerError::TypeNotMatched {
-                                left: left_type.name.clone(),
-                                right: right_type.name.clone(),
-                            })
-                        }
-                    }
-                    BinOp::And | BinOp::Not => {
-                        if (left_type.name != "bool" || right_type.name != "bool") {
-                            return Err(AnalyzerError::TypeNotMatched {
-                                left: left_type.name.clone(),
-                                right: right_type.name.clone(),
-                            });
-                        }
-                        Ok(VarTypeField {
-                            name: "bool".to_string(),
-                            is_optional: false,
-                            args: vec![],
-                        })
-                    }
-                    _ => Err(AnalyzerError::NotImplemented),
+                } else {
+                    Err(AnalyzerError::NotDefined(name.clone()))
                 }
             }
-            _ => {
-                Err(AnalyzerError::FailedToDetermineType)
+            Expr::IntLiteral(_) => Ok(Type::IntLiteral),
+            Expr::FloatLiteral(_) => Ok(Type::FloatLiteral),
+            Expr::StringLiteral { .. } => Ok(Type::Named("string".to_string())),
+            Expr::BoolLiteral(_) => Ok(Type::Named("bool".to_string())),
+            Expr::NoneLiteral => Ok(Type::None),
+            Expr::Binary { left, op, right } => {
+                let _ = self.type_from_expr(left, ctx)?;
+                let _ = self.type_from_expr(right, ctx)?;
+                match op {
+                    BinOp::Equal
+                    | BinOp::NotEqual
+                    | BinOp::LessThan
+                    | BinOp::LessThanOrEqual
+                    | BinOp::GreaterThan
+                    | BinOp::GreaterThanOrEqual
+                    | BinOp::And
+                    | BinOp::Or => Ok(Type::Named("bool".to_string())),
+                    BinOp::RangeClosed | BinOp::RangeHalfOpen => {
+                        let inner = Type::Named("int64".to_string());
+                        Ok(Type::Range(Box::new(inner)))
+                    }
+                    _ => Ok(Type::Named("int64".to_string())),
+                }
+            }
+            Expr::Unary { expr, .. } => self.type_from_expr(expr, ctx),
+            Expr::Call { callee, args } => {
+                let callee_ty = self.type_from_expr(callee, ctx)?;
+                match callee_ty {
+                    Type::Function(params, ret) => {
+                        let _ = params;
+                        for arg in args {
+                            self.type_from_expr(arg, ctx)?;
+                        }
+                        Ok(*ret)
+                    }
+                    Type::TypeObject(name) => {
+                        if let Some(info) = ctx.get_type(&name).cloned() {
+                            match info {
+                                TypeInfo::Class(class_info) => {
+                                    for arg in args {
+                                        self.type_from_expr(arg, ctx)?;
+                                    }
+                                    Ok(Type::Named(class_info.name))
+                                }
+                                TypeInfo::Struct(struct_info) => {
+                                    for arg in args {
+                                        self.type_from_expr(arg, ctx)?;
+                                    }
+                                    Ok(Type::Named(struct_info.name))
+                                }
+                                _ => Ok(Type::Any),
+                            }
+                        } else {
+                            Ok(Type::Any)
+                        }
+                    }
+                    _ => Ok(Type::Any),
+                }
+            }
+            Expr::Function { params, body } => {
+                ctx.push_scope();
+                let result = (|| {
+                    let mut param_types = Vec::new();
+                    for (param_name, param_ty) in params.iter() {
+                        let ty = self.type_from_field(param_ty)?;
+                        param_types.push(ty.clone());
+                        ctx.declare(Symbol {
+                            name: param_name.clone(),
+                            value: SymbolValue::Variable {
+                                ty,
+                                mutable: true,
+                            },
+                        })?;
+                    }
+                    for stmt in body {
+                        self.analyze_node(stmt, ctx)?;
+                    }
+                    Ok(Type::Function(param_types, Box::new(Type::None)))
+                })();
+                ctx.pop_scope();
+                result
+            }
+            Expr::Lambda { params, body } => {
+                ctx.push_scope();
+                let result = (|| {
+                    let mut param_types = Vec::new();
+                    for (param_name, param_ty) in params.iter() {
+                        let ty = self.type_from_field(param_ty)?;
+                        param_types.push(ty.clone());
+                        ctx.declare(Symbol {
+                            name: param_name.clone(),
+                            value: SymbolValue::Variable {
+                                ty,
+                                mutable: true,
+                            },
+                        })?;
+                    }
+                    let mut return_ty = Type::None;
+                    match body {
+                        LambdaBody::Expr(expr) => {
+                            return_ty = self.type_from_expr(expr, ctx)?;
+                        }
+                        LambdaBody::Block(block) => {
+                            for stmt in block {
+                                self.analyze_node(stmt, ctx)?;
+                            }
+                        }
+                    }
+                    Ok(Type::Function(param_types, Box::new(return_ty)))
+                })();
+                ctx.pop_scope();
+                result
+            }
+            Expr::VarDecl { name, expr, .. } => {
+                let ty = self.type_from_expr(expr, ctx)?;
+                ctx.redeclare(Symbol {
+                    name: name.clone(),
+                    value: SymbolValue::Variable {
+                        ty: ty.clone(),
+                        mutable: true,
+                    },
+                });
+                Ok(ty)
+            }
+            Expr::Assign { target, value } => {
+                let value_ty = self.type_from_expr(value, ctx)?;
+                match &**target {
+                    Expr::Identifier(name) => {
+                        ctx.assign(name, value_ty.clone())?;
+                        Ok(value_ty)
+                    }
+                    _ => Ok(value_ty),
+                }
+            }
+            Expr::MemberAccess { target, member } => {
+                if let Some(inner) = target {
+                    let base_ty = self.type_from_expr(inner, ctx)?;
+                    self.resolve_member_access(base_ty, member, ctx)
+                } else {
+                    if let Some(parent) = ctx.enum_variants.get(member) {
+                        return Ok(Type::Named(parent.clone()));
+                    }
+                    Err(AnalyzerError::NotDefined(member.clone()))
+                }
+            }
+            Expr::CompoundAssign { target, value, .. } => {
+                let value_ty = self.type_from_expr(value, ctx)?;
+                match &**target {
+                    Expr::Identifier(name) => {
+                        ctx.assign(name, value_ty.clone())?;
+                    }
+                    _ => {}
+                }
+                Ok(value_ty)
+            }
+            Expr::ArrayLiteral(items) => {
+                if let Some(first) = items.first() {
+                    let inner_ty = self.type_from_expr(first, ctx)?;
+                    for item in items.iter().skip(1) {
+                        let _ = self.type_from_expr(item, ctx)?;
+                    }
+                    Ok(Type::Array(Box::new(inner_ty)))
+                } else {
+                    Ok(Type::Array(Box::new(Type::Unknown)))
+                }
+            }
+            Expr::DictLiteral(items) => {
+                if let Some((key, value)) = items.first() {
+                    let key_ty = self.type_from_expr(key, ctx)?;
+                    let value_ty = self.type_from_expr(value, ctx)?;
+                    Ok(Type::Dict(Box::new(key_ty), Box::new(value_ty)))
+                } else {
+                    Ok(Type::Dict(Box::new(Type::Unknown), Box::new(Type::Unknown)))
+                }
+            }
+            Expr::TupleLiteral(items) => {
+                let mut types = Vec::new();
+                for item in items {
+                    types.push(self.type_from_expr(item, ctx)?);
+                }
+                Ok(Type::Tuple(types))
+            }
+            Expr::Range { start, end, .. } => {
+                self.type_from_expr(start, ctx)?;
+                self.type_from_expr(end, ctx)?;
+                Ok(Type::Range(Box::new(Type::Named("int64".to_string()))))
+            }
+            Expr::Index { target, index } => {
+                let base_ty = self.type_from_expr(target, ctx)?;
+                self.type_from_expr(index, ctx)?;
+                match base_ty {
+                    Type::Array(inner) => Ok(*inner),
+                    Type::Dict(_, value) => Ok(*value),
+                    _ => Ok(Type::Unknown),
+                }
+            }
+            Expr::Unwrap { target } => {
+                let base = self.type_from_expr(target, ctx)?;
+                if let Some(inner) = base.unwrap_optional() {
+                    Ok(inner)
+                } else {
+                    Ok(base)
+                }
+            }
+            Expr::OptionalChaining { target } => {
+                let base = self.type_from_expr(target, ctx)?;
+                Ok(base)
+            }
+            Expr::NullCoalescing { left, right } => {
+                let left_ty = self.type_from_expr(left, ctx)?;
+                let right_ty = self.type_from_expr(right, ctx)?;
+                Ok(Type::union(vec![left_ty, right_ty]))
             }
         }
+    }
+
+    fn resolve_member_access(
+        &self,
+        base_ty: Type,
+        member: &str,
+        ctx: &mut AnalyzerContext,
+    ) -> Result<Type, AnalyzerError> {
+        match base_ty {
+            Type::TypeObject(name) => {
+                if let Some(TypeInfo::Class(info)) = ctx.get_type(&name) {
+                    if let Some(field_ty) = info.static_fields.get(member) {
+                        return Ok(field_ty.clone());
+                    }
+                    if let Some(method) = info.static_methods.get(member) {
+                        return Ok(Type::Function(method.params.clone(), Box::new(method.return_type.clone())));
+                    }
+                }
+                Err(AnalyzerError::NotDefined(format!("{}.{}", name, member)))
+            }
+            Type::Named(name) => {
+                if let Some(TypeInfo::Class(info)) = ctx.get_type(&name) {
+                    if let Some(field_ty) = info.instance_fields.get(member) {
+                        return Ok(field_ty.clone());
+                    }
+                    if let Some(method) = info.instance_methods.get(member) {
+                        return Ok(Type::Function(method.params.clone(), Box::new(method.return_type.clone())));
+                    }
+                }
+                if let Some(TypeInfo::Struct(info)) = ctx.get_type(&name) {
+                    for (field_name, ty) in &info.fields {
+                        if field_name == member {
+                            return Ok(ty.clone());
+                        }
+                    }
+                }
+                if name == "string" {
+                    return match member {
+                        "upper" | "lower" | "trim" => Ok(Type::Function(Vec::new(), Box::new(Type::Named("string".to_string())))),
+                        "length" => Ok(Type::Named("uint64".to_string())),
+                        _ => Err(AnalyzerError::NotDefined(format!("{}.{}", name, member))),
+                    };
+                }
+                Err(AnalyzerError::NotDefined(format!("{}.{}", name, member)))
+            }
+            Type::Array(inner) => {
+                match member {
+                    "length" => Ok(Type::Named("uint64".to_string())),
+                    "append" | "removeAt" => Ok(Type::Function(vec![(*inner).clone()], Box::new(Type::None))),
+                    _ => Err(AnalyzerError::NotDefined(member.to_string())),
+                }
+            }
+            Type::Dict(_, value) => {
+                match member {
+                    "get" => Ok(Type::Function(vec![Type::Unknown], Box::new(*value))),
+                    _ => Err(AnalyzerError::NotDefined(member.to_string())),
+                }
+            }
+            Type::Optional(inner) => self.resolve_member_access(*inner, member, ctx),
+            Type::Any | Type::Unknown => Ok(Type::Any),
+            _ => Err(AnalyzerError::NotDefined(member.to_string())),
+        }
+    }
+
+    fn install_std(&self, ctx: &mut AnalyzerContext) {
+        let primitives = vec![
+            "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float32", "float64",
+            "bool", "string",
+        ];
+        for primitive in primitives {
+            ctx.types.insert(primitive.to_string(), TypeInfo::Primitive);
+        }
+        ctx.declare(Symbol {
+            name: "print".to_string(),
+            value: SymbolValue::Function(FunctionInfo {
+                params: vec![Type::Any],
+                return_type: Type::None,
+                is_method: false,
+                is_static: false,
+            }),
+        })
+        .ok();
+        ctx.declare(Symbol {
+            name: "exit".to_string(),
+            value: SymbolValue::Function(FunctionInfo {
+                params: vec![Type::Named("int32".to_string())],
+                return_type: Type::None,
+                is_method: false,
+                is_static: false,
+            }),
+        })
+        .ok();
+
+        let mut random_module = HashMap::new();
+        random_module.insert(
+            "random".to_string(),
+            SymbolValue::Function(FunctionInfo {
+                params: Vec::new(),
+                return_type: Type::Named("float64".to_string()),
+                is_method: false,
+                is_static: false,
+            }),
+        );
+        ctx.declare(Symbol {
+            name: "random".to_string(),
+            value: SymbolValue::Module(random_module),
+        })
+        .ok();
+
+        let view_fn_type = Type::Function(
+            Vec::new(),
+            Box::new(Type::Named("string".to_string())),
+        );
+        let route_return = Type::Function(
+            vec![view_fn_type.clone()],
+            Box::new(view_fn_type.clone()),
+        );
+        let mut app_module = HashMap::new();
+        app_module.insert(
+            "route".to_string(),
+            SymbolValue::Function(FunctionInfo {
+                params: vec![Type::Named("string".to_string())],
+                return_type: route_return,
+                is_method: false,
+                is_static: false,
+            }),
+        );
+        ctx.declare(Symbol {
+            name: "app".to_string(),
+            value: SymbolValue::Module(app_module),
+        })
+        .ok();
+
+        let mut test_module = HashMap::new();
+        test_module.insert(
+            "test".to_string(),
+            SymbolValue::Function(FunctionInfo {
+                params: Vec::new(),
+                return_type: Type::None,
+                is_method: false,
+                is_static: false,
+            }),
+        );
+        test_module.insert(
+            "test2".to_string(),
+            SymbolValue::Function(FunctionInfo {
+                params: Vec::new(),
+                return_type: Type::None,
+                is_method: false,
+                is_static: false,
+            }),
+        );
+        ctx.declare(Symbol {
+            name: "test".to_string(),
+            value: SymbolValue::Module(test_module),
+        })
+        .ok();
+
+        ctx.types.insert(
+            "ZeroDivisionError".to_string(),
+            TypeInfo::Class(ClassInfo::new("ZeroDivisionError")),
+        );
+        ctx.declare(Symbol {
+            name: "ZeroDivisionError".to_string(),
+            value: SymbolValue::TypeName("ZeroDivisionError".to_string()),
+        })
+        .ok();
+        ctx.types.insert(
+            "Exception".to_string(),
+            TypeInfo::Class(ClassInfo::new("Exception")),
+        );
+        ctx.declare(Symbol {
+            name: "Exception".to_string(),
+            value: SymbolValue::TypeName("Exception".to_string()),
+        })
+        .ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+
+    use crate::analyzer::Analyzer;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn analyze_source(source: &str) -> Result<(), String> {
+        let mut lexer = Lexer::new(source);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let ast = parser.parse_file().map_err(|e| e.to_string())?;
+        let analyzer = Analyzer::new(ast);
+        analyzer.analyze()
+    }
+
+    #[test]
+    fn examples_should_analyze_successfully() {
+        let example_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("example");
+        for entry in fs::read_dir(example_dir).expect("read example dir") {
+            let entry = entry.expect("entry");
+            if !entry.file_type().expect("file type").is_file() {
+                continue;
+            }
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("tpy") {
+                continue;
+            }
+            let content = fs::read_to_string(entry.path()).expect("read example");
+            analyze_source(&content).unwrap_or_else(|err| {
+                panic!("analysis failed for {:?}: {}", entry.path(), err);
+            });
+        }
+    }
+
+    #[test]
+    fn reports_undefined_variable() {
+        let source = "def broken() -> uint32 { return missing; }";
+        let result = analyze_source(source);
+        assert!(result.is_err());
     }
 }
