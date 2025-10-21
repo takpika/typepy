@@ -11,6 +11,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 fn main() -> io::Result<()> {
     // コマンドライン引数からファイル名を取得
@@ -37,7 +38,7 @@ fn main() -> io::Result<()> {
 
     let filename = &filenames[0];
     // ファイルの内容を読み込む
-    let source_code = fs::read_to_string(filename)?;
+    let source_code: Arc<str> = Arc::from(fs::read_to_string(filename)?);
     // ===============================
     // 1. 字句解析 (Lexer)
     // ===============================
@@ -51,7 +52,7 @@ fn main() -> io::Result<()> {
     // ===============================
     // 2. 構文解析 (Parser)
     // ===============================
-    let mut parser = parser::Parser::new(tokens);
+    let mut parser = parser::Parser::new(source_code.clone(), tokens);
     let parse_result = match parser.parse_file() {
         Ok(ast) => {
             println!("\n--- Parsed AST ---");

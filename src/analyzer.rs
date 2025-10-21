@@ -1214,15 +1214,17 @@ impl Analyzer {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::sync::Arc;
 
     use crate::analyzer::Analyzer;
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
     fn analyze_source(source: &str) -> Result<(), String> {
-        let mut lexer = Lexer::new(source);
+        let source_arc: Arc<str> = Arc::from(source);
+        let mut lexer = Lexer::new(&source_arc);
         let tokens = lexer.tokenize();
-        let mut parser = Parser::new(tokens);
+        let mut parser = Parser::new(source_arc, tokens);
         let ast = parser.parse_file().map_err(|e| e.to_string())?;
         let analyzer = Analyzer::new(ast);
         analyzer.analyze()
