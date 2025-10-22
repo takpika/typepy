@@ -1,0 +1,5 @@
+def toSecond(hours: uint64) -> uint64 {
+    return hours * 60 * 60;
+}
+
+print(toSecond(10));

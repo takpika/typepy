@@ -64,6 +64,7 @@ pub enum AstNode {
         name: String,
         members: Vec<AstNode>,
         parents: Vec<String>,
+        span: Span,
     },
 
     /// 関数定義 (例: `def greet(user: User) -> None { ... }`)
@@ -75,11 +76,13 @@ pub enum AstNode {
         is_static: bool,                     // static 修飾子があれば true
         is_private: bool,                    // private 修飾子があれば true
         decorators: Vec<Decorator>,          // デコレータ (@deprecated など)
+        span: Span,
     },
 
     StructDef {
         name: String,
         fields: Vec<StructField>,
+        span: Span,
     },
 
     /// 変数宣言 (例: `final name: str = "Alice";`)
@@ -90,11 +93,13 @@ pub enum AstNode {
         expr: Option<Expr>, // 初期化式
         is_static: bool,    // static 修飾子があれば true
         is_private: bool,
+        span: Span,
     },
 
     EnumDef {
         name: String,
         variants: Vec<String>,
+        span: Span,
     },
 
     /// 式ステートメント (例: `print("hello");`)
@@ -1297,6 +1302,7 @@ impl Parser {
     }
 
     fn parse_enum(&mut self) -> ParseResult<AstNode> {
+        let enum_start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         let enum_name = match self.current_token() {
             Token::Identifier(ref s) => {
                 let name = s.clone();
@@ -1340,14 +1346,18 @@ impl Parser {
         } else {
             return Err(self.error("Missing '}' at end of enum definition"));
         }
+        let enum_end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+        let enum_span = Span::new(enum_start_span.start, enum_end_span.end);
 
         Ok(AstNode::EnumDef {
             name: enum_name,
             variants,
+            span: enum_span,
         })
     }
 
     fn parse_struct(&mut self) -> ParseResult<AstNode> {
+        let struct_start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         // たとえば "struct Point { x: int64; y: int64; }"
         // 1) expect Identifier (構造体名)
         let struct_name = match self.current_token() {
@@ -1386,12 +1396,15 @@ impl Parser {
         } else {
             return Err(self.error("Missing '}' at end of struct definition"));
         }
+        let struct_end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+        let struct_span = Span::new(struct_start_span.start, struct_end_span.end);
 
         // ここでASTノードを返す
         // 構造体を表すAstNodeを追加するなり、VarDeclのようなものを使うなり好きに
         Ok(AstNode::StructDef {
             name: struct_name,
             fields,
+            span: struct_span,
         })
     }
 
@@ -1459,6 +1472,7 @@ impl Parser {
 
     /// class定義: class クラス名 { ... }
     fn parse_class(&mut self) -> ParseResult<AstNode> {
+        let class_start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         // expect identifier
         let class_name = match self.current_token() {
             Token::Identifier(ref s) => {
@@ -1521,11 +1535,14 @@ impl Parser {
         } else {
             return Err(self.error("Missing '}' in class definition"));
         }
+        let class_end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+        let class_span = Span::new(class_start_span.start, class_end_span.end);
 
         Ok(AstNode::ClassDef {
             name: class_name,
             members,
             parents,
+            span: class_span,
         })
     }
 
@@ -1537,6 +1554,7 @@ impl Parser {
         has_parent: bool,
         decorators: Vec<Decorator>,
     ) -> ParseResult<AstNode> {
+        let func_start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         // 関数名
         let func_name = match self.current_token() {
             Token::Identifier(ref s) => {
@@ -1647,6 +1665,8 @@ impl Parser {
         } else {
             return Err(self.error("Missing '}' at end of function"));
         }
+        let func_end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+        let func_span = Span::new(func_start_span.start, func_end_span.end);
 
         Ok(AstNode::FunctionDef {
             name: func_name,
@@ -1656,6 +1676,7 @@ impl Parser {
             is_static,
             is_private,
             decorators,
+            span: func_span,
         })
     }
 
@@ -1666,6 +1687,7 @@ impl Parser {
         is_static: bool,
         is_private: bool,
     ) -> ParseResult<AstNode> {
+        let decl_start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         let decl_type = match decl_token {
             Token::Final => VarDeclType::Final,
             Token::Let => VarDeclType::Let,
@@ -1714,6 +1736,8 @@ impl Parser {
         if self.current_token() == Token::Semicolon {
             self.advance();
         }
+        let decl_end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+        let decl_span = Span::new(decl_start_span.start, decl_end_span.end);
 
         Ok(AstNode::VarDecl {
             name: var_name,
@@ -1722,6 +1746,7 @@ impl Parser {
             expr: init_expr,
             is_static,
             is_private,
+            span: decl_span,
         })
     }
 

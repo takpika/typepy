@@ -135,6 +135,7 @@ impl PythonTranspiler {
                 name,
                 members,
                 parents,
+                span: _,
             } => {
                 let indent = self.indent();
                 let parent_str = if parents.is_empty() {
@@ -155,7 +156,11 @@ impl PythonTranspiler {
                 self.indent_level -= 1;
                 result
             }
-            AstNode::StructDef { name, fields } => {
+            AstNode::StructDef {
+                name,
+                fields,
+                span: _,
+            } => {
                 self.needs_dataclass = true;
                 let indent = self.indent();
                 let mut result = format!("{}@dataclass\n{}class {}:\n", indent, indent, name);
@@ -188,6 +193,7 @@ impl PythonTranspiler {
                 is_static,
                 is_private,
                 decorators,
+                span: _,
             } => {
                 let indent = self.indent();
                 let mut result = String::new();
@@ -255,7 +261,10 @@ impl PythonTranspiler {
                 name,
                 var_type,
                 expr,
-                ..
+                decl_type: _,
+                is_static: _,
+                is_private: _,
+                span: _,
             } => {
                 if let Some(init_expr) = expr {
                     if let Some(definition) =
@@ -280,7 +289,11 @@ impl PythonTranspiler {
                 }
                 line
             }
-            AstNode::EnumDef { name, variants } => {
+            AstNode::EnumDef {
+                name,
+                variants,
+                span: _,
+            } => {
                 self.needs_enum = true;
                 for variant in variants {
                     self.enum_variants.insert(variant.clone(), name.clone());

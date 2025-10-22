@@ -1,0 +1,84 @@
+{
+  "name": "typepy-vscode",
+  "displayName": "TypePy",
+  "description": "Syntax highlighting and editor support for the TypePy language.",
+  "version": "0.0.1",
+  "publisher": "typepy",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/taku/typepy"
+  },
+  "main": "./extension.js",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:typepy",
+    "onCommand:typepy.analyzeFile"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "typepy",
+        "aliases": [
+          "TypePy",
+          "typepy"
+        ],
+        "extensions": [
+          ".tpy"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "typepy",
+        "scopeName": "source.typepy",
+        "path": "./syntaxes/typepy.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "typepy.analyzeFile",
+        "title": "TypePy: Analyze Current File"
+      }
+    ],
+    "configuration": {
+      "title": "TypePy",
+      "properties": {
+        "typepy.analyzer.command": {
+          "type": "string",
+          "default": "",
+          "description": "Override the executable used for TypePy analysis. Leave empty to auto-detect."
+        },
+        "typepy.analyzer.args": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Extra arguments passed to the analyzer command before the file path."
+        },
+        "typepy.analyzer.runOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run the TypePy analyzer automatically whenever a .tpy file is saved."
+        },
+        "typepy.analyzer.runOnChange": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run the TypePy analyzer while typing (debounced). May increase CPU usage."
+        },
+        "typepy.analyzer.changeDebounceMs": {
+          "type": "number",
+          "default": 700,
+          "minimum": 100,
+          "description": "Delay in milliseconds before running the analyzer after edits when runOnChange is enabled."
+        }
+      }
+    }
+  }
+}

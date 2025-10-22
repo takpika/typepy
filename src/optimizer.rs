@@ -12,10 +12,12 @@ fn optimize_node(node: AstNode) -> AstNode {
             name,
             members,
             parents,
+            span,
         } => AstNode::ClassDef {
             name,
             members: members.into_iter().map(optimize_node).collect(),
             parents,
+            span,
         },
         AstNode::FunctionDef {
             name,
@@ -25,6 +27,7 @@ fn optimize_node(node: AstNode) -> AstNode {
             is_static,
             is_private,
             decorators,
+            span,
         } => AstNode::FunctionDef {
             name,
             params,
@@ -33,8 +36,9 @@ fn optimize_node(node: AstNode) -> AstNode {
             is_static,
             is_private,
             decorators: decorators.into_iter().map(optimize_decorator).collect(),
+            span,
         },
-        AstNode::StructDef { name, fields } => AstNode::StructDef { name, fields },
+        AstNode::StructDef { name, fields, span } => AstNode::StructDef { name, fields, span },
         AstNode::VarDecl {
             name,
             var_type,
@@ -42,6 +46,7 @@ fn optimize_node(node: AstNode) -> AstNode {
             expr,
             is_static,
             is_private,
+            span,
         } => AstNode::VarDecl {
             name,
             var_type,
@@ -49,8 +54,17 @@ fn optimize_node(node: AstNode) -> AstNode {
             expr: expr.map(optimize_expr),
             is_static,
             is_private,
+            span,
         },
-        AstNode::EnumDef { name, variants } => AstNode::EnumDef { name, variants },
+        AstNode::EnumDef {
+            name,
+            variants,
+            span,
+        } => AstNode::EnumDef {
+            name,
+            variants,
+            span,
+        },
         AstNode::ExprStmt(expr) => AstNode::ExprStmt(optimize_expr(expr)),
         AstNode::ReturnStmt(expr) => AstNode::ReturnStmt(expr.map(optimize_expr)),
         AstNode::SwitchStmt {

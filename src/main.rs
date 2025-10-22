@@ -6,7 +6,7 @@ mod parser;
 mod token;
 mod transpiler;
 
-use core::panic;
+use serde_json::json;
 use std::env;
 use std::fs;
 use std::io;
@@ -18,22 +18,39 @@ fn main() -> io::Result<()> {
     // コマンドライン引数からファイル名を取得
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} [--no-std] <filename>", args[0]);
+        eprintln!(
+            "Usage: {} [--no-std] [--check] [--emit-symbols] <filename>",
+            args[0]
+        );
         return Ok(());
     }
 
     let mut use_std = true;
+    let mut check_only = false;
+    let mut emit_symbols = false;
     let mut filenames = Vec::new();
     for arg in args.iter().skip(1) {
-        if arg == "--no-std" {
-            use_std = false;
-        } else {
-            filenames.push(arg.clone());
+        match arg.as_str() {
+            "--no-std" => {
+                use_std = false;
+            }
+            "--check" => {
+                check_only = true;
+            }
+            "--emit-symbols" => {
+                emit_symbols = true;
+            }
+            _ => {
+                filenames.push(arg.clone());
+            }
         }
     }
 
     if filenames.is_empty() {
-        eprintln!("Usage: {} [--no-std] <filename>", args[0]);
+        eprintln!(
+            "Usage: {} [--no-std] [--check] [--emit-symbols] <filename>",
+            args[0]
+        );
         return Ok(());
     }
 
@@ -79,11 +96,23 @@ fn main() -> io::Result<()> {
         analyzer.set_use_std(false);
     }
     match analyzer.analyze() {
-        Ok(_) => {
-            let python_code = transpiler::transpile_to_python(&analyzer.root_node);
-            let output_py = Path::new(filename).with_extension("py");
-            fs::write(&output_py, python_code)?;
-            println!("Transpiled Python written to {}", output_py.display());
+        Ok(summary) => {
+            if check_only {
+                println!("Analysis succeeded.");
+            } else {
+                let python_code = transpiler::transpile_to_python(&analyzer.root_node);
+                let output_py = Path::new(filename).with_extension("py");
+                fs::write(&output_py, python_code)?;
+                println!("Transpiled Python written to {}", output_py.display());
+            }
+            if emit_symbols {
+                let payload = json!({
+                    "kind": "typepy-symbols",
+                    "file": filename,
+                    "summary": summary,
+                });
+                println!("{}", payload.to_string());
+            }
         }
         Err(e) => {
             let formatted = analyzer.format_error(&e);

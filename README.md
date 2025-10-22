@@ -54,3 +54,39 @@ string bool
 ```bash
 cargo run -- example/example.tpy
 ```
+
+## VS Code 拡張機能
+
+`vscode-typepy` ディレクトリには TypePy 用の VS Code 拡張機能が含まれています。
+次の手順でビルド・インストールできます。
+
+1. `cargo build` で TypePy バイナリをビルド（`target/debug/typepy` を生成）
+2. `cd vscode-typepy`
+3. `npm install`
+4. `npx vsce package` で `.vsix` を生成
+5. VS Code の「Extensions: Install from VSIX...」コマンドでインストール
+
+拡張機能は `.tpy` ファイル保存時にコンパイラの字句解析〜意味解析（Analyzer）までを実行し、結果をエディタ上にダイアグノスティックとして表示します。
+コマンドパレットの `TypePy: Analyze Current File` から手動実行も可能で、次のようなエディタ支援機能を提供します。
+
+- 解析結果で報告されたエラーのダイアグノスティック表示
+- キーワード／組み込み型に加え、プロジェクト内の関数・変数・列挙体を型情報付きで提示する自動補完
+- `EnumName.` と入力した際の列挙値候補のサジェスト
+- 関数や変数、列挙体にマウスを合わせると Analyzer が推定した型情報をツールチップで表示
+
+設定の `typepy.analyzer.runOnChange` を `true` にすると、編集中（デフォルト 700ms デバウンス）にも解析が走り、ホバー／補完にほぼリアルタイムの結果が反映されます。
+
+### CLI オプション
+
+コマンドラインから解析のみを行いたい場合は `--check` フラグを利用してください。
+
+```bash
+cargo run -- --check example/control_flow.tpy
+```
+
+解析に成功すると `Analysis succeeded.` が表示され、失敗した場合は該当箇所の行・列情報付きでエラーが表示されます。
+`--emit-symbols` フラグを併用すると、解析結果から得られた関数／変数／型の情報を JSON 形式で標準出力へ出力できます（VS Code 拡張機能はこの情報を自動的に利用します）。
+
+```bash
+cargo run -- --check --emit-symbols example/control_flow.tpy
+```

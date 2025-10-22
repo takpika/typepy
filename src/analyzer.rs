@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use crate::parser::AstNode;
@@ -11,6 +12,7 @@ use crate::parser::SwitchCase;
 use crate::parser::VarDeclType;
 use crate::parser::VarTypeField;
 use crate::token::Span;
+use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -84,6 +86,53 @@ impl Type {
             other => other.to_string(),
         }
     }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Type::Any => "Any".to_string(),
+            Type::Unknown => "Unknown".to_string(),
+            Type::None => "None".to_string(),
+            Type::Named(name) => name.clone(),
+            Type::Array(inner) => format!("[{}]", inner.describe()),
+            Type::Dict(key, value) => format!("{{{}: {}}}", key.describe(), value.describe()),
+            Type::Tuple(items) => {
+                let parts: Vec<String> = items.iter().map(|t| t.describe()).collect();
+                format!("({})", parts.join(", "))
+            }
+            Type::Function(params, ret) => {
+                let params_str = params
+                    .iter()
+                    .map(|p| p.describe())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("function({}) -> {}", params_str, ret.describe())
+            }
+            Type::Union(types) => types
+                .iter()
+                .map(|t| t.describe())
+                .collect::<Vec<_>>()
+                .join(" | "),
+            Type::Optional(inner) => {
+                let inner_repr = inner.describe();
+                match inner.as_ref() {
+                    Type::Union(_) | Type::Function(_, _) | Type::Tuple(_) => {
+                        format!("({})?", inner_repr)
+                    }
+                    _ => format!("{}?", inner_repr),
+                }
+            }
+            Type::IntLiteral => "int".to_string(),
+            Type::FloatLiteral => "float".to_string(),
+            Type::TypeObject(name) => format!("type {}", name),
+            Type::Range(inner) => format!("Range<{}>", inner.describe()),
+        }
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.describe())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +176,91 @@ pub struct StructInfo {
 pub struct EnumInfo {
     pub name: String,
     pub variants: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ParameterSummary {
+    pub name: String,
+    pub type_repr: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocationSummary {
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+fn location_from_span(span: &Span) -> LocationSummary {
+    LocationSummary {
+        start_line: span.start.line.saturating_sub(1),
+        start_column: span.start.column,
+        end_line: span.end.line.saturating_sub(1),
+        end_column: span.end.column,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionSummary {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    pub params: Vec<ParameterSummary>,
+    pub return_type: String,
+    pub is_method: bool,
+    pub is_static: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<LocationSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VariableSummary {
+    pub name: String,
+    pub type_repr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_static: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<LocationSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldSummary {
+    pub name: String,
+    pub type_repr: String,
+    pub is_static: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TypeSummary {
+    Class {
+        name: String,
+        fields: Vec<FieldSummary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        location: Option<LocationSummary>,
+    },
+    Struct {
+        name: String,
+        fields: Vec<FieldSummary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        location: Option<LocationSummary>,
+    },
+    Enum {
+        name: String,
+        variants: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        location: Option<LocationSummary>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct AnalysisSummary {
+    pub functions: Vec<FunctionSummary>,
+    pub variables: Vec<VariableSummary>,
+    pub types: Vec<TypeSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +334,7 @@ struct AnalyzerContext {
     types: HashMap<String, TypeInfo>,
     enum_variants: HashMap<String, String>,
     current_return: Vec<Option<Type>>,
+    summary: AnalysisSummary,
 }
 
 impl AnalyzerContext {
@@ -209,6 +344,7 @@ impl AnalyzerContext {
             types: HashMap::new(),
             enum_variants: HashMap::new(),
             current_return: Vec::new(),
+            summary: AnalysisSummary::default(),
         }
     }
 
@@ -288,6 +424,10 @@ impl AnalyzerContext {
         })?;
         Ok(())
     }
+
+    fn is_global_scope(&self) -> bool {
+        self.scopes.len() == 1
+    }
 }
 
 pub struct Analyzer {
@@ -317,12 +457,13 @@ impl Analyzer {
         self.use_std = use_std;
     }
 
-    pub fn analyze(&self) -> Result<(), AnalyzerError> {
+    pub fn analyze(&self) -> Result<AnalysisSummary, AnalyzerError> {
         let mut ctx = AnalyzerContext::new();
         if self.use_std {
             self.install_std(&mut ctx);
         }
-        self.analyze_node(&self.root_node, &mut ctx)
+        self.analyze_node(&self.root_node, &mut ctx)?;
+        Ok(ctx.summary)
     }
 
     pub fn format_error(&self, error: &AnalyzerError) -> String {
@@ -404,9 +545,16 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            AstNode::ClassDef { name, members, .. } => {
+            AstNode::ClassDef {
+                name,
+                members,
+                span,
+                ..
+            } => {
                 ctx.insert_type(name.clone(), TypeInfo::Class(ClassInfo::new(name)))?;
                 let mut info = ClassInfo::new(name);
+                let mut field_summaries: Vec<FieldSummary> = Vec::new();
+                let mut method_summaries: Vec<FunctionSummary> = Vec::new();
                 for member in members {
                     match member {
                         AstNode::VarDecl {
@@ -424,11 +572,17 @@ impl Analyzer {
                             } else {
                                 Type::Unknown
                             };
+                            let type_repr = field_type.describe();
                             if *is_static {
                                 info.static_fields.insert(field_name.clone(), field_type);
                             } else {
                                 info.instance_fields.insert(field_name.clone(), field_type);
                             }
+                            field_summaries.push(FieldSummary {
+                                name: field_name.clone(),
+                                type_repr,
+                                is_static: *is_static,
+                            });
                         }
                         AstNode::FunctionDef {
                             name: fn_name,
@@ -436,12 +590,16 @@ impl Analyzer {
                             return_type,
                             body,
                             is_static,
+                            span: method_span,
                             ..
                         } => {
-                            let mut param_types = Vec::new();
-                            for (_, ty) in params {
-                                param_types.push(self.type_from_field(ty)?);
+                            let mut param_entries: Vec<(String, Type)> = Vec::new();
+                            for (param_name, param_field) in params.iter() {
+                                let param_ty = self.type_from_field(param_field)?;
+                                param_entries.push((param_name.clone(), param_ty));
                             }
+                            let param_types =
+                                param_entries.iter().map(|(_, ty)| ty.clone()).collect();
                             let ret_type = if let Some(ret) = return_type {
                                 self.type_from_field(ret)?
                             } else {
@@ -457,14 +615,15 @@ impl Analyzer {
                                     },
                                 })?;
                             }
-                            for (index, (param_name, param_ty)) in params.iter().enumerate() {
+                            for (index, (param_name, param_ty)) in param_entries.iter().enumerate()
+                            {
                                 if !*is_static && index == 0 && param_name == "self" {
                                     continue;
                                 }
                                 ctx.declare(Symbol {
                                     name: param_name.clone(),
                                     value: SymbolValue::Variable {
-                                        ty: self.type_from_field(param_ty)?,
+                                        ty: param_ty.clone(),
                                         mutable: true,
                                     },
                                 })?;
@@ -489,6 +648,29 @@ impl Analyzer {
                             } else {
                                 info.instance_methods.insert(fn_name.clone(), fn_info);
                             }
+                            let display_params = param_entries
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, (param_name, param_ty))| {
+                                    if !*is_static && index == 0 && param_name == "self" {
+                                        None
+                                    } else {
+                                        Some(ParameterSummary {
+                                            name: param_name.clone(),
+                                            type_repr: param_ty.describe(),
+                                        })
+                                    }
+                                })
+                                .collect();
+                            method_summaries.push(FunctionSummary {
+                                name: fn_name.clone(),
+                                container: Some(name.clone()),
+                                params: display_params,
+                                return_type: ret_type.describe(),
+                                is_method: !*is_static,
+                                is_static: *is_static,
+                                location: Some(location_from_span(&method_span)),
+                            });
                         }
                         AstNode::PassStmt => {}
                         _ => {
@@ -499,30 +681,60 @@ impl Analyzer {
                         .insert(name.clone(), TypeInfo::Class(info.clone()));
                 }
                 ctx.types.insert(name.clone(), TypeInfo::Class(info));
+                ctx.summary.types.push(TypeSummary::Class {
+                    name: name.clone(),
+                    fields: field_summaries,
+                    location: Some(location_from_span(&span)),
+                });
+                ctx.summary.functions.extend(method_summaries);
                 Ok(())
             }
-            AstNode::StructDef { name, fields } => {
+            AstNode::StructDef { name, fields, span } => {
                 let mut struct_fields = Vec::new();
                 for field in fields {
                     struct_fields.push((field.name.clone(), self.type_from_field(&field.ty)?));
                 }
+                let field_summaries: Vec<FieldSummary> = struct_fields
+                    .iter()
+                    .map(|(field_name, field_type)| FieldSummary {
+                        name: field_name.clone(),
+                        type_repr: field_type.describe(),
+                        is_static: false,
+                    })
+                    .collect();
                 let info = StructInfo {
                     name: name.clone(),
-                    fields: struct_fields,
+                    fields: struct_fields.clone(),
                 };
                 ctx.insert_type(name.clone(), TypeInfo::Struct(info))?;
+                ctx.summary.types.push(TypeSummary::Struct {
+                    name: name.clone(),
+                    fields: field_summaries,
+                    location: Some(location_from_span(&span)),
+                });
                 Ok(())
             }
-            AstNode::EnumDef { name, variants } => {
+            AstNode::EnumDef {
+                name,
+                variants,
+                span,
+            } => {
                 let mut info = EnumInfo {
                     name: name.clone(),
                     variants: HashSet::new(),
                 };
+                let mut enum_variants = Vec::new();
                 for variant in variants {
                     info.variants.insert(variant.clone());
                     ctx.enum_variants.insert(variant.clone(), name.clone());
+                    enum_variants.push(variant.clone());
                 }
                 ctx.insert_type(name.clone(), TypeInfo::Enum(info))?;
+                ctx.summary.types.push(TypeSummary::Enum {
+                    name: name.clone(),
+                    variants: enum_variants,
+                    location: Some(location_from_span(&span)),
+                });
                 Ok(())
             }
             AstNode::FunctionDef {
@@ -531,6 +743,7 @@ impl Analyzer {
                 return_type,
                 body,
                 decorators,
+                span,
                 ..
             } => {
                 let mut param_entries = Vec::new();
@@ -555,7 +768,7 @@ impl Analyzer {
                     value: SymbolValue::Function(fn_info.clone()),
                 })?;
                 ctx.push_scope();
-                ctx.current_return.push(Some(ret_type));
+                ctx.current_return.push(Some(ret_type.clone()));
                 for (param_name, param_ty) in &param_entries {
                     ctx.declare(Symbol {
                         name: param_name.clone(),
@@ -573,6 +786,24 @@ impl Analyzer {
                 if !decorators.is_empty() {
                     self.apply_decorators(name, decorators, false, false, ctx)?;
                 }
+                if ctx.is_global_scope() {
+                    let params_summary = param_entries
+                        .iter()
+                        .map(|(param_name, param_ty)| ParameterSummary {
+                            name: param_name.clone(),
+                            type_repr: param_ty.describe(),
+                        })
+                        .collect();
+                    ctx.summary.functions.push(FunctionSummary {
+                        name: name.clone(),
+                        container: None,
+                        params: params_summary,
+                        return_type: ret_type.describe(),
+                        is_method: false,
+                        is_static: false,
+                        location: Some(location_from_span(&span)),
+                    });
+                }
                 Ok(())
             }
             AstNode::VarDecl {
@@ -580,6 +811,7 @@ impl Analyzer {
                 var_type,
                 expr,
                 decl_type,
+                span,
                 ..
             } => {
                 let ty = if let Some(var_ty) = var_type {
@@ -589,6 +821,16 @@ impl Analyzer {
                 } else {
                     Type::Unknown
                 };
+                if ctx.is_global_scope() {
+                    let type_repr = ty.describe();
+                    ctx.summary.variables.push(VariableSummary {
+                        name: name.clone(),
+                        type_repr,
+                        container: None,
+                        is_static: None,
+                        location: Some(location_from_span(&span)),
+                    });
+                }
                 ctx.redeclare(Symbol {
                     name: name.clone(),
                     value: SymbolValue::Variable {
@@ -1334,7 +1576,7 @@ mod tests {
             .parse_file()
             .map_err(|e| AnalyzerError::new(e.to_string(), Some(e.span)))?;
         let analyzer = Analyzer::new(ast, source_arc.clone());
-        analyzer.analyze()
+        analyzer.analyze().map(|_| ())
     }
 
     #[test]
