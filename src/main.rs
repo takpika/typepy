@@ -11,6 +11,7 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::process;
 use std::sync::Arc;
 
 fn main() -> io::Result<()> {
@@ -46,8 +47,8 @@ fn main() -> io::Result<()> {
     let tokens = lexer.tokenize();
 
     // トークンを一覧表示（デバッグ用）
-    println!("--- Tokens ---");
-    println!("{:?}", tokens);
+    // println!("--- Tokens ---");
+    // println!("{:?}", tokens);
 
     // ===============================
     // 2. 構文解析 (Parser)
@@ -55,39 +56,39 @@ fn main() -> io::Result<()> {
     let mut parser = parser::Parser::new(source_code.clone(), tokens);
     let parse_result = match parser.parse_file() {
         Ok(ast) => {
-            println!("\n--- Parsed AST ---");
-            println!("{:#?}", ast);
+            // println!("\n--- Parsed AST ---");
+            // println!("{:#?}", ast);
             // 出力内容をファイルに書き込む
-            let output_filename = format!("{}.ast", filename);
-            fs::write(output_filename, format!("{:#?}", ast))?;
-            Ok::<_, io::Error>(ast)
+            // let output_filename = format!("{}.ast", filename);
+            // fs::write(output_filename, format!("{:#?}", ast))?;
+            ast
         }
         Err(e) => {
             eprintln!("Parse Error: {}", e);
-            panic!();
+            process::exit(1);
         }
-    }?;
+    };
 
     // ===============================
     // 3. 意味解析 (Analyzer)
     // ===============================
     let optimized_ast = optimizer::optimize_ast(parse_result);
 
-    let mut analyzer = analyzer::Analyzer::new(optimized_ast);
+    let mut analyzer = analyzer::Analyzer::new(optimized_ast, source_code.clone());
     if !use_std {
         analyzer.set_use_std(false);
     }
     match analyzer.analyze() {
         Ok(_) => {
-            println!("Analysis OK");
             let python_code = transpiler::transpile_to_python(&analyzer.root_node);
             let output_py = Path::new(filename).with_extension("py");
             fs::write(&output_py, python_code)?;
             println!("Transpiled Python written to {}", output_py.display());
         }
         Err(e) => {
-            eprintln!("Analyze Error: {}", e);
-            panic!();
+            let formatted = analyzer.format_error(&e);
+            eprintln!("Analyze Error: {}", formatted);
+            process::exit(1);
         }
     }
 

@@ -19,6 +19,16 @@ impl Position {
     }
 }
 
+impl Default for Position {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            line: 1,
+            column: 0,
+        }
+    }
+}
+
 /// トークンがどの範囲に対応するかを保持する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -29,6 +39,49 @@ pub struct Span {
 impl Span {
     pub fn new(start: Position, end: Position) -> Self {
         Self { start, end }
+    }
+
+    pub fn snippet(&self, source: &str) -> Option<String> {
+        if self.start.line == 0 {
+            return None;
+        }
+
+        let line_index = self.start.line.checked_sub(1)?;
+        let line = source.lines().nth(line_index)?.trim_end_matches('\r');
+
+        let line_len = line.chars().count();
+        let mut start_col = self.start.column;
+        if start_col > line_len {
+            start_col = line_len;
+        }
+
+        let caret_len = if self.start.line == self.end.line {
+            let mut end_col = self.end.column.max(self.start.column + 1);
+            if end_col > line_len {
+                end_col = line_len;
+            }
+            end_col.saturating_sub(start_col).max(1)
+        } else {
+            line_len.saturating_sub(start_col).max(1)
+        };
+
+        let mut caret_line = String::with_capacity(start_col + caret_len);
+        caret_line.extend(std::iter::repeat(' ').take(start_col));
+        caret_line.extend(std::iter::repeat('^').take(caret_len));
+
+        Some(format!(
+            "{:>4} | {}\n     | {}",
+            self.start.line, line, caret_line
+        ))
+    }
+}
+
+impl Default for Span {
+    fn default() -> Self {
+        Self {
+            start: Position::default(),
+            end: Position::default(),
+        }
     }
 }
 

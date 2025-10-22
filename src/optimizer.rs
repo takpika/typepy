@@ -137,7 +137,7 @@ fn optimize_lambda_body(body: LambdaBody) -> LambdaBody {
 
 fn optimize_expr(expr: Expr) -> Expr {
     match expr {
-        Expr::Identifier(_)
+        Expr::Identifier { .. }
         | Expr::IntLiteral(_)
         | Expr::FloatLiteral(_)
         | Expr::StringLiteral { .. }
@@ -194,9 +194,14 @@ fn optimize_expr(expr: Expr) -> Expr {
             target: Box::new(optimize_expr(*target)),
             value: Box::new(optimize_expr(*value)),
         },
-        Expr::MemberAccess { target, member } => Expr::MemberAccess {
+        Expr::MemberAccess {
+            target,
+            member,
+            span,
+        } => Expr::MemberAccess {
             target: target.map(|inner| Box::new(optimize_expr(*inner))),
             member,
+            span,
         },
         Expr::CompoundAssign { op, target, value } => Expr::CompoundAssign {
             op,

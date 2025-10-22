@@ -180,7 +180,10 @@ pub struct ImportName {
 /// 式(Expressions)のAST
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Identifier(String),
+    Identifier {
+        name: String,
+        span: Span,
+    },
     IntLiteral(i64),
     FloatLiteral(f64),
     StringLiteral {
@@ -232,6 +235,7 @@ pub enum Expr {
     MemberAccess {
         target: Option<Box<Expr>>,
         member: String,
+        span: Span,
     },
 
     CompoundAssign {
@@ -358,37 +362,7 @@ impl Parser {
     }
 
     fn make_snippet(&self, span: Span) -> Option<String> {
-        if span.start.line == 0 {
-            return None;
-        }
-
-        let line_index = span.start.line.checked_sub(1)?;
-        let line = self.source.lines().nth(line_index)?.trim_end_matches('\r');
-
-        let line_len = line.chars().count();
-        let mut start_col = span.start.column;
-        if start_col > line_len {
-            start_col = line_len;
-        }
-
-        let caret_len = if span.start.line == span.end.line {
-            let mut end_col = span.end.column.max(span.start.column + 1);
-            if end_col > line_len {
-                end_col = line_len;
-            }
-            end_col.saturating_sub(start_col).max(1)
-        } else {
-            line_len.saturating_sub(start_col).max(1)
-        };
-
-        let mut caret_line = String::with_capacity(start_col + caret_len);
-        caret_line.extend(std::iter::repeat(' ').take(start_col));
-        caret_line.extend(std::iter::repeat('^').take(caret_len));
-
-        Some(format!(
-            "{:>4} | {}\n     | {}",
-            span.start.line, line, caret_line
-        ))
+        span.snippet(&self.source)
     }
 
     /// Indentトークンを連続でスキップするヘルパー
@@ -1978,7 +1952,7 @@ impl Parser {
                 let st = s.clone();
                 self.advance();
                 match lhs {
-                    Expr::Identifier(name) => {
+                    Expr::Identifier { name, span } => {
                         if name == "f" {
                             let vars = Self::extract_interpolations(&st);
                             return Ok(Expr::StringLiteral {
@@ -1999,7 +1973,7 @@ impl Parser {
                                 vars: vec![],
                             });
                         }
-                        return Ok(Expr::Identifier(name));
+                        return Ok(Expr::Identifier { name, span });
                     }
                     _ => {
                         return Ok(lhs);
@@ -2224,13 +2198,20 @@ impl Parser {
             Token::Identifier(ref name) => {
                 let ident_name = name.clone();
                 self.advance(); // consume identifier
+                let ident_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
 
                 // もし次が '(' なら関数呼び出し
                 if self.current_token() == Token::LParen {
-                    self.parse_call_expr(Expr::Identifier(ident_name))?
+                    self.parse_call_expr(Expr::Identifier {
+                        name: ident_name,
+                        span: ident_span,
+                    })?
                 } else {
                     // 単なる識別子
-                    Expr::Identifier(ident_name)
+                    Expr::Identifier {
+                        name: ident_name,
+                        span: ident_span,
+                    }
                 }
             }
             // リテラル
@@ -2256,13 +2237,18 @@ impl Parser {
             Token::LParen => self.parse_paren_expr()?,
             Token::Dot => {
                 self.advance();
+                let dot_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
                 match self.current_token() {
                     Token::Identifier(ref field_name) => {
                         let field = field_name.clone();
+                        let ident_span =
+                            self.current_span().unwrap_or_else(|| self.fallback_span());
                         self.advance();
+                        let span = Span::new(dot_span.start, ident_span.end);
                         Expr::MemberAccess {
                             target: None,
                             member: field,
+                            span,
                         }
                     }
                     ref other => {
@@ -2287,13 +2273,18 @@ impl Parser {
         loop {
             if self.current_token() == Token::Dot {
                 self.advance();
+                let dot_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
                 match self.current_token() {
                     Token::Identifier(ref field_name) => {
                         let field = field_name.clone();
+                        let ident_span =
+                            self.current_span().unwrap_or_else(|| self.fallback_span());
                         self.advance();
+                        let span = Span::new(dot_span.start, ident_span.end);
                         let member_expr = Expr::MemberAccess {
                             target: Some(Box::new(expr)),
                             member: field,
+                            span,
                         };
                         expr = member_expr;
                     }
@@ -2589,7 +2580,8 @@ impl Parser {
                 Token::Identifier(ref name) => {
                     let nm = name.clone();
                     self.advance();
-                    Expr::Identifier(nm)
+                    let span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                    Expr::Identifier { name: nm, span }
                 }
                 // 他はエラー
                 ref other => {

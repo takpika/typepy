@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::parser::AstNode;
 use crate::parser::BinOp;
@@ -9,6 +10,7 @@ use crate::parser::LambdaBody;
 use crate::parser::SwitchCase;
 use crate::parser::VarDeclType;
 use crate::parser::VarTypeField;
+use crate::token::Span;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -150,11 +152,47 @@ pub struct Symbol {
     pub value: SymbolValue,
 }
 
-#[derive(Debug)]
-pub enum AnalyzerError {
-    AlreadyDefined(String),
-    NotDefined(String),
-    InvalidOperation(String),
+#[derive(Debug, Clone)]
+pub struct AnalyzerError {
+    pub message: String,
+    pub span: Option<Span>,
+}
+
+impl AnalyzerError {
+    pub fn new(message: impl Into<String>, span: Option<Span>) -> Self {
+        Self {
+            message: message.into(),
+            span,
+        }
+    }
+
+    pub fn already_defined(name: &str, span: Option<Span>) -> Self {
+        Self::new(format!("{} is already defined", name), span)
+    }
+
+    pub fn not_defined(name: &str, span: Option<Span>) -> Self {
+        Self::new(format!("{} is not defined", name), span)
+    }
+
+    pub fn invalid_operation(message: impl Into<String>, span: Option<Span>) -> Self {
+        Self::new(message, span)
+    }
+
+    pub fn format_with_source(&self, source: &str) -> String {
+        if let Some(span) = self.span {
+            let mut result = format!(
+                "{} (line {}:{}, line {}:{})",
+                self.message, span.start.line, span.start.column, span.end.line, span.end.column
+            );
+            if let Some(snippet) = span.snippet(source) {
+                result.push('\n');
+                result.push_str(&snippet);
+            }
+            result
+        } else {
+            self.message.clone()
+        }
+    }
 }
 
 struct AnalyzerContext {
@@ -185,7 +223,7 @@ impl AnalyzerContext {
     fn declare(&mut self, symbol: Symbol) -> Result<(), AnalyzerError> {
         let scope = self.scopes.last_mut().unwrap();
         if scope.contains_key(&symbol.name) {
-            return Err(AnalyzerError::AlreadyDefined(symbol.name));
+            return Err(AnalyzerError::already_defined(&symbol.name, None));
         }
         scope.insert(symbol.name.clone(), symbol);
         Ok(())
@@ -197,29 +235,33 @@ impl AnalyzerContext {
         }
     }
 
-    fn assign(&mut self, name: &str, ty: Type) -> Result<(), AnalyzerError> {
+    fn assign(&mut self, name: &str, ty: Type, span: Option<Span>) -> Result<(), AnalyzerError> {
         for scope in self.scopes.iter_mut().rev() {
             if let Some(symbol) = scope.get_mut(name) {
                 match &mut symbol.value {
-                    SymbolValue::Variable { ty: existing, mutable } => {
+                    SymbolValue::Variable {
+                        ty: existing,
+                        mutable,
+                    } => {
                         if !*mutable {
-                            return Err(AnalyzerError::InvalidOperation(format!(
-                                "{} is immutable", name
-                            )));
+                            return Err(AnalyzerError::invalid_operation(
+                                format!("{} is immutable", name),
+                                span,
+                            ));
                         }
                         *existing = ty;
                         return Ok(());
                     }
                     _ => {
-                        return Err(AnalyzerError::InvalidOperation(format!(
-                            "{} is not a variable",
-                            name
-                        )));
+                        return Err(AnalyzerError::invalid_operation(
+                            format!("{} is not a variable", name),
+                            span,
+                        ));
                     }
                 }
             }
         }
-        Err(AnalyzerError::NotDefined(name.to_string()))
+        Err(AnalyzerError::not_defined(name, span))
     }
 
     fn lookup(&self, name: &str) -> Option<&Symbol> {
@@ -237,7 +279,7 @@ impl AnalyzerContext {
 
     fn insert_type(&mut self, name: String, info: TypeInfo) -> Result<(), AnalyzerError> {
         if self.types.contains_key(&name) {
-            return Err(AnalyzerError::AlreadyDefined(name));
+            return Err(AnalyzerError::already_defined(&name, None));
         }
         self.types.insert(name.clone(), info);
         self.declare(Symbol {
@@ -251,33 +293,40 @@ impl AnalyzerContext {
 pub struct Analyzer {
     pub root_node: AstNode,
     use_std: bool,
+    source: Arc<str>,
 }
 
 impl Analyzer {
-    pub fn new(root_node: AstNode) -> Self {
+    pub fn new(root_node: AstNode, source: Arc<str>) -> Self {
         Self {
             root_node,
             use_std: true,
+            source,
         }
     }
 
-    pub fn with_std(root_node: AstNode, use_std: bool) -> Self {
-        Self { root_node, use_std }
+    pub fn with_std(root_node: AstNode, use_std: bool, source: Arc<str>) -> Self {
+        Self {
+            root_node,
+            use_std,
+            source,
+        }
     }
 
     pub fn set_use_std(&mut self, use_std: bool) {
         self.use_std = use_std;
     }
 
-    pub fn analyze(&self) -> Result<(), String> {
+    pub fn analyze(&self) -> Result<(), AnalyzerError> {
         let mut ctx = AnalyzerContext::new();
         if self.use_std {
             self.install_std(&mut ctx);
         }
-        match self.analyze_node(&self.root_node, &mut ctx) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("{:?}", e)),
-        }
+        self.analyze_node(&self.root_node, &mut ctx)
+    }
+
+    pub fn format_error(&self, error: &AnalyzerError) -> String {
+        error.format_with_source(&self.source)
     }
 
     fn analyze_node(&self, node: &AstNode, ctx: &mut AnalyzerContext) -> Result<(), AnalyzerError> {
@@ -290,15 +339,18 @@ impl Analyzer {
             }
             AstNode::Import { module, names } => {
                 if let Some(module_name) = module {
-                    if let Some(std_module) = ctx
-                        .lookup(module_name)
-                        .and_then(|symbol| match &symbol.value {
-                            SymbolValue::Module(map) => Some(map.clone()),
-                            _ => None,
-                        })
+                    if let Some(std_module) =
+                        ctx.lookup(module_name)
+                            .and_then(|symbol| match &symbol.value {
+                                SymbolValue::Module(map) => Some(map.clone()),
+                                _ => None,
+                            })
                     {
                         for import in names {
-                            let key = import.as_name.clone().unwrap_or_else(|| import.name.clone());
+                            let key = import
+                                .as_name
+                                .clone()
+                                .unwrap_or_else(|| import.name.clone());
                             if let Some(value) = std_module.get(&import.name).cloned() {
                                 ctx.redeclare(Symbol { name: key, value });
                             } else {
@@ -312,7 +364,10 @@ impl Analyzer {
                     }
                 } else {
                     for import in names {
-                        let alias = import.as_name.clone().unwrap_or_else(|| import.name.clone());
+                        let alias = import
+                            .as_name
+                            .clone()
+                            .unwrap_or_else(|| import.name.clone());
                         if let Some(symbol) = ctx.lookup(&import.name) {
                             match &symbol.value {
                                 SymbolValue::Module(map) => {
@@ -338,7 +393,10 @@ impl Analyzer {
                     return Ok(());
                 }
                 for import in names {
-                    let key = import.as_name.clone().unwrap_or_else(|| import.name.clone());
+                    let key = import
+                        .as_name
+                        .clone()
+                        .unwrap_or_else(|| import.name.clone());
                     ctx.redeclare(Symbol {
                         name: key,
                         value: SymbolValue::Module(HashMap::new()),
@@ -437,7 +495,8 @@ impl Analyzer {
                             self.analyze_node(member, ctx)?;
                         }
                     }
-                    ctx.types.insert(name.clone(), TypeInfo::Class(info.clone()));
+                    ctx.types
+                        .insert(name.clone(), TypeInfo::Class(info.clone()));
                 }
                 ctx.types.insert(name.clone(), TypeInfo::Class(info));
                 Ok(())
@@ -552,7 +611,11 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            AstNode::SwitchStmt { expr, cases, default } => {
+            AstNode::SwitchStmt {
+                expr,
+                cases,
+                default,
+            } => {
                 let switch_ty = self.type_from_expr(expr, ctx)?;
                 for case in cases {
                     self.analyze_switch_case(case, &switch_ty, ctx)?;
@@ -566,7 +629,11 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            AstNode::IfStmt { condition, body, else_body } => {
+            AstNode::IfStmt {
+                condition,
+                body,
+                else_body,
+            } => {
                 self.type_from_expr(condition, ctx)?;
                 ctx.push_scope();
                 for stmt in body {
@@ -582,7 +649,10 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            AstNode::GuardStmt { condition, else_body } => {
+            AstNode::GuardStmt {
+                condition,
+                else_body,
+            } => {
                 match condition.as_ref() {
                     Expr::VarDecl { name, expr, .. } => {
                         let condition_ty = self.type_from_expr(expr, ctx)?;
@@ -609,7 +679,11 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            AstNode::ForStmt { var_name, iterable, body } => {
+            AstNode::ForStmt {
+                var_name,
+                iterable,
+                body,
+            } => {
                 let iter_ty = self.type_from_expr(iterable, ctx)?;
                 ctx.push_scope();
                 ctx.declare(Symbol {
@@ -629,7 +703,11 @@ impl Analyzer {
                 ctx.pop_scope();
                 Ok(())
             }
-            AstNode::TryStmt { body, catch_blocks, finally_block } => {
+            AstNode::TryStmt {
+                body,
+                catch_blocks,
+                finally_block,
+            } => {
                 ctx.push_scope();
                 for stmt in body {
                     self.analyze_node(stmt, ctx)?;
@@ -677,7 +755,10 @@ impl Analyzer {
             };
             let call_expr = Expr::Call {
                 callee: Box::new(decorator_call),
-                args: vec![Expr::Identifier(function_name.to_string())],
+                args: vec![Expr::Identifier {
+                    name: function_name.to_string(),
+                    span: Span::default(),
+                }],
             };
             let ty = self.type_from_expr(&call_expr, ctx)?;
             let value = match ty {
@@ -703,16 +784,23 @@ impl Analyzer {
     fn decorator_to_expr(&self, name: &str) -> Expr {
         let mut parts = name.split('.');
         if let Some(first) = parts.next() {
-            let mut expr = Expr::Identifier(first.to_string());
+            let mut expr = Expr::Identifier {
+                name: first.to_string(),
+                span: Span::default(),
+            };
             for part in parts {
                 expr = Expr::MemberAccess {
                     target: Some(Box::new(expr)),
                     member: part.to_string(),
+                    span: Span::default(),
                 };
             }
             expr
         } else {
-            Expr::Identifier(name.to_string())
+            Expr::Identifier {
+                name: name.to_string(),
+                span: Span::default(),
+            }
         }
     }
 
@@ -726,7 +814,7 @@ impl Analyzer {
         if let Type::Named(enum_name) = switch_ty {
             if let Some(TypeInfo::Enum(enum_info)) = ctx.get_type(enum_name) {
                 if !enum_info.variants.contains(&case.pattern) {
-                    return Err(AnalyzerError::NotDefined(case.pattern.clone()));
+                    return Err(AnalyzerError::not_defined(&case.pattern, None));
                 }
             }
         }
@@ -802,19 +890,26 @@ impl Analyzer {
         }
     }
 
-    fn type_from_expr(&self, expr: &Expr, ctx: &mut AnalyzerContext) -> Result<Type, AnalyzerError> {
+    fn type_from_expr(
+        &self,
+        expr: &Expr,
+        ctx: &mut AnalyzerContext,
+    ) -> Result<Type, AnalyzerError> {
         match expr {
-            Expr::Identifier(name) => {
+            Expr::Identifier { name, span } => {
                 if let Some(symbol) = ctx.lookup(name) {
                     match &symbol.value {
                         SymbolValue::Variable { ty, .. } => Ok(ty.clone()),
-                        SymbolValue::Function(info) => Ok(Type::Function(info.params.clone(), Box::new(info.return_type.clone()))),
+                        SymbolValue::Function(info) => Ok(Type::Function(
+                            info.params.clone(),
+                            Box::new(info.return_type.clone()),
+                        )),
                         SymbolValue::TypeName(type_name) => Ok(Type::TypeObject(type_name.clone())),
                         SymbolValue::EnumVariant { parent } => Ok(Type::Named(parent.clone())),
                         SymbolValue::Module(_) => Ok(Type::Any),
                     }
                 } else {
-                    Err(AnalyzerError::NotDefined(name.clone()))
+                    Err(AnalyzerError::not_defined(name, Some(*span)))
                 }
             }
             Expr::IntLiteral(_) => Ok(Type::IntLiteral),
@@ -885,10 +980,7 @@ impl Analyzer {
                         param_types.push(ty.clone());
                         ctx.declare(Symbol {
                             name: param_name.clone(),
-                            value: SymbolValue::Variable {
-                                ty,
-                                mutable: true,
-                            },
+                            value: SymbolValue::Variable { ty, mutable: true },
                         })?;
                     }
                     for stmt in body {
@@ -908,10 +1000,7 @@ impl Analyzer {
                         param_types.push(ty.clone());
                         ctx.declare(Symbol {
                             name: param_name.clone(),
-                            value: SymbolValue::Variable {
-                                ty,
-                                mutable: true,
-                            },
+                            value: SymbolValue::Variable { ty, mutable: true },
                         })?;
                     }
                     let mut return_ty = Type::None;
@@ -944,29 +1033,33 @@ impl Analyzer {
             Expr::Assign { target, value } => {
                 let value_ty = self.type_from_expr(value, ctx)?;
                 match &**target {
-                    Expr::Identifier(name) => {
-                        ctx.assign(name, value_ty.clone())?;
+                    Expr::Identifier { name, span } => {
+                        ctx.assign(name, value_ty.clone(), Some(*span))?;
                         Ok(value_ty)
                     }
                     _ => Ok(value_ty),
                 }
             }
-            Expr::MemberAccess { target, member } => {
+            Expr::MemberAccess {
+                target,
+                member,
+                span,
+            } => {
                 if let Some(inner) = target {
                     let base_ty = self.type_from_expr(inner, ctx)?;
-                    self.resolve_member_access(base_ty, member, ctx)
+                    self.resolve_member_access(base_ty, member, *span, ctx)
                 } else {
                     if let Some(parent) = ctx.enum_variants.get(member) {
                         return Ok(Type::Named(parent.clone()));
                     }
-                    Err(AnalyzerError::NotDefined(member.clone()))
+                    Err(AnalyzerError::not_defined(member, Some(*span)))
                 }
             }
             Expr::CompoundAssign { target, value, .. } => {
                 let value_ty = self.type_from_expr(value, ctx)?;
                 match &**target {
-                    Expr::Identifier(name) => {
-                        ctx.assign(name, value_ty.clone())?;
+                    Expr::Identifier { name, span } => {
+                        ctx.assign(name, value_ty.clone(), Some(*span))?;
                     }
                     _ => {}
                 }
@@ -1037,6 +1130,7 @@ impl Analyzer {
         &self,
         base_ty: Type,
         member: &str,
+        span: Span,
         ctx: &mut AnalyzerContext,
     ) -> Result<Type, AnalyzerError> {
         match base_ty {
@@ -1046,10 +1140,16 @@ impl Analyzer {
                         return Ok(field_ty.clone());
                     }
                     if let Some(method) = info.static_methods.get(member) {
-                        return Ok(Type::Function(method.params.clone(), Box::new(method.return_type.clone())));
+                        return Ok(Type::Function(
+                            method.params.clone(),
+                            Box::new(method.return_type.clone()),
+                        ));
                     }
                 }
-                Err(AnalyzerError::NotDefined(format!("{}.{}", name, member)))
+                Err(AnalyzerError::not_defined(
+                    &format!("{}.{}", name, member),
+                    Some(span),
+                ))
             }
             Type::Named(name) => {
                 if let Some(TypeInfo::Class(info)) = ctx.get_type(&name) {
@@ -1057,7 +1157,10 @@ impl Analyzer {
                         return Ok(field_ty.clone());
                     }
                     if let Some(method) = info.instance_methods.get(member) {
-                        return Ok(Type::Function(method.params.clone(), Box::new(method.return_type.clone())));
+                        return Ok(Type::Function(
+                            method.params.clone(),
+                            Box::new(method.return_type.clone()),
+                        ));
                     }
                 }
                 if let Some(TypeInfo::Struct(info)) = ctx.get_type(&name) {
@@ -1069,36 +1172,43 @@ impl Analyzer {
                 }
                 if name == "string" {
                     return match member {
-                        "upper" | "lower" | "trim" => Ok(Type::Function(Vec::new(), Box::new(Type::Named("string".to_string())))),
+                        "upper" | "lower" | "trim" => Ok(Type::Function(
+                            Vec::new(),
+                            Box::new(Type::Named("string".to_string())),
+                        )),
                         "length" => Ok(Type::Named("uint64".to_string())),
-                        _ => Err(AnalyzerError::NotDefined(format!("{}.{}", name, member))),
+                        _ => Err(AnalyzerError::not_defined(
+                            &format!("{}.{}", name, member),
+                            Some(span),
+                        )),
                     };
                 }
-                Err(AnalyzerError::NotDefined(format!("{}.{}", name, member)))
+                Err(AnalyzerError::not_defined(
+                    &format!("{}.{}", name, member),
+                    Some(span),
+                ))
             }
-            Type::Array(inner) => {
-                match member {
-                    "length" => Ok(Type::Named("uint64".to_string())),
-                    "append" | "removeAt" => Ok(Type::Function(vec![(*inner).clone()], Box::new(Type::None))),
-                    _ => Err(AnalyzerError::NotDefined(member.to_string())),
+            Type::Array(inner) => match member {
+                "length" => Ok(Type::Named("uint64".to_string())),
+                "append" | "removeAt" => {
+                    Ok(Type::Function(vec![(*inner).clone()], Box::new(Type::None)))
                 }
-            }
-            Type::Dict(_, value) => {
-                match member {
-                    "get" => Ok(Type::Function(vec![Type::Unknown], Box::new(*value))),
-                    _ => Err(AnalyzerError::NotDefined(member.to_string())),
-                }
-            }
-            Type::Optional(inner) => self.resolve_member_access(*inner, member, ctx),
+                _ => Err(AnalyzerError::not_defined(member, Some(span))),
+            },
+            Type::Dict(_, value) => match member {
+                "get" => Ok(Type::Function(vec![Type::Unknown], Box::new(*value))),
+                _ => Err(AnalyzerError::not_defined(member, Some(span))),
+            },
+            Type::Optional(inner) => self.resolve_member_access(*inner, member, span, ctx),
             Type::Any | Type::Unknown => Ok(Type::Any),
-            _ => Err(AnalyzerError::NotDefined(member.to_string())),
+            _ => Err(AnalyzerError::not_defined(member, Some(span))),
         }
     }
 
     fn install_std(&self, ctx: &mut AnalyzerContext) {
         let primitives = vec![
-            "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float32", "float64",
-            "bool", "string",
+            "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float32",
+            "float64", "bool", "string",
         ];
         for primitive in primitives {
             ctx.types.insert(primitive.to_string(), TypeInfo::Primitive);
@@ -1140,14 +1250,9 @@ impl Analyzer {
         })
         .ok();
 
-        let view_fn_type = Type::Function(
-            Vec::new(),
-            Box::new(Type::Named("string".to_string())),
-        );
-        let route_return = Type::Function(
-            vec![view_fn_type.clone()],
-            Box::new(view_fn_type.clone()),
-        );
+        let view_fn_type = Type::Function(Vec::new(), Box::new(Type::Named("string".to_string())));
+        let route_return =
+            Type::Function(vec![view_fn_type.clone()], Box::new(view_fn_type.clone()));
         let mut app_module = HashMap::new();
         app_module.insert(
             "route".to_string(),
@@ -1216,23 +1321,26 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use crate::analyzer::Analyzer;
+    use crate::analyzer::{Analyzer, AnalyzerError};
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
-    fn analyze_source(source: &str) -> Result<(), String> {
+    fn analyze_source(source: &str) -> Result<(), AnalyzerError> {
         let source_arc: Arc<str> = Arc::from(source);
         let mut lexer = Lexer::new(&source_arc);
         let tokens = lexer.tokenize();
-        let mut parser = Parser::new(source_arc, tokens);
-        let ast = parser.parse_file().map_err(|e| e.to_string())?;
-        let analyzer = Analyzer::new(ast);
+        let mut parser = Parser::new(source_arc.clone(), tokens);
+        let ast = parser
+            .parse_file()
+            .map_err(|e| AnalyzerError::new(e.to_string(), Some(e.span)))?;
+        let analyzer = Analyzer::new(ast, source_arc.clone());
         analyzer.analyze()
     }
 
     #[test]
     fn examples_should_analyze_successfully() {
         let example_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("example");
+        let expected_failures = ["control_flow.tpy"];
         for entry in fs::read_dir(example_dir).expect("read example dir") {
             let entry = entry.expect("entry");
             if !entry.file_type().expect("file type").is_file() {
@@ -1241,9 +1349,29 @@ mod tests {
             if entry.path().extension().and_then(|s| s.to_str()) != Some("tpy") {
                 continue;
             }
+            let file_name = entry
+                .path()
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
             let content = fs::read_to_string(entry.path()).expect("read example");
+            if expected_failures.contains(&file_name.as_str()) {
+                let err = analyze_source(&content).expect_err("analysis unexpectedly succeeded");
+                let formatted = err.format_with_source(&content);
+                assert!(
+                    formatted.contains("line"),
+                    "expected location info in error: {}",
+                    formatted
+                );
+                continue;
+            }
             analyze_source(&content).unwrap_or_else(|err| {
-                panic!("analysis failed for {:?}: {}", entry.path(), err);
+                panic!(
+                    "analysis failed for {:?}: {}",
+                    entry.path(),
+                    err.format_with_source(&content)
+                );
             });
         }
     }
@@ -1253,5 +1381,11 @@ mod tests {
         let source = "def broken() -> uint32 { return missing; }";
         let result = analyze_source(source);
         assert!(result.is_err());
+        let message = result
+            .err()
+            .map(|err| err.format_with_source(source))
+            .unwrap();
+        assert!(message.contains("missing is not defined"));
+        assert!(message.contains("line 1:"));
     }
 }

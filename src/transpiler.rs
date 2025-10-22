@@ -316,7 +316,7 @@ impl PythonTranspiler {
                 }
                 _ => {
                     if let Expr::Assign { target, value } = expr {
-                        if let Expr::Identifier(name) = target.as_ref() {
+                        if let Expr::Identifier { ref name, .. } = target.as_ref() {
                             if let Some(definition) =
                                 self.maybe_emit_named_function_literal(name, value.as_ref())
                             {
@@ -691,7 +691,7 @@ impl PythonTranspiler {
 
     fn transpile_expr(&mut self, expr: &Expr) -> String {
         match expr {
-            Expr::Identifier(name) => name.clone(),
+            Expr::Identifier { name, .. } => name.clone(),
             Expr::IntLiteral(value) => value.to_string(),
             Expr::FloatLiteral(value) => {
                 let mut s = value.to_string();
@@ -712,6 +712,7 @@ impl PythonTranspiler {
                 if let Expr::MemberAccess {
                     target: Some(target),
                     member,
+                    ..
                 } = callee.as_ref()
                 {
                     if let Expr::OptionalChaining { target: inner } = target.as_ref() {
@@ -792,7 +793,7 @@ impl PythonTranspiler {
                 let value_str = self.transpile_expr(value);
                 format!("{} = {}", target_str, value_str)
             }
-            Expr::MemberAccess { target, member } => {
+            Expr::MemberAccess { target, member, .. } => {
                 if let Some(target_expr) = target {
                     if let Expr::OptionalChaining { target: inner } = target_expr.as_ref() {
                         let base = self.transpile_expr(inner.as_ref());
