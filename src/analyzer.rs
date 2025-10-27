@@ -672,7 +672,7 @@ impl Analyzer {
                                 location: Some(location_from_span(&method_span)),
                             });
                         }
-                        AstNode::PassStmt => {}
+                        AstNode::PassStmt { .. } => {}
                         _ => {
                             self.analyze_node(member, ctx)?;
                         }
@@ -840,13 +840,13 @@ impl Analyzer {
                 });
                 Ok(())
             }
-            AstNode::ExprStmt(expr) => {
+            AstNode::ExprStmt { expr, .. } => {
                 self.type_from_expr(expr, ctx)?;
                 Ok(())
             }
-            AstNode::ReturnStmt(expr) => {
+            AstNode::ReturnStmt { value, .. } => {
                 if let Some(expected) = ctx.current_return.last().cloned().flatten() {
-                    if let Some(value_expr) = expr {
+                    if let Some(value_expr) = value {
                         let _ty = self.type_from_expr(value_expr, ctx)?;
                         let _ = expected;
                     }
@@ -857,6 +857,7 @@ impl Analyzer {
                 expr,
                 cases,
                 default,
+                span: _,
             } => {
                 let switch_ty = self.type_from_expr(expr, ctx)?;
                 for case in cases {
@@ -875,6 +876,7 @@ impl Analyzer {
                 condition,
                 body,
                 else_body,
+                span: _,
             } => {
                 self.type_from_expr(condition, ctx)?;
                 ctx.push_scope();
@@ -894,6 +896,7 @@ impl Analyzer {
             AstNode::GuardStmt {
                 condition,
                 else_body,
+                span: _,
             } => {
                 match condition.as_ref() {
                     Expr::VarDecl { name, expr, .. } => {
@@ -925,6 +928,7 @@ impl Analyzer {
                 var_name,
                 iterable,
                 body,
+                span: _,
             } => {
                 let iter_ty = self.type_from_expr(iterable, ctx)?;
                 ctx.push_scope();
@@ -949,6 +953,7 @@ impl Analyzer {
                 body,
                 catch_blocks,
                 finally_block,
+                span: _,
             } => {
                 ctx.push_scope();
                 for stmt in body {
@@ -967,13 +972,13 @@ impl Analyzer {
                 }
                 Ok(())
             }
-            AstNode::ThrowStmt(expr) => {
+            AstNode::ThrowStmt { expr, .. } => {
                 self.type_from_expr(expr, ctx)?;
                 Ok(())
             }
-            AstNode::PassStmt => Ok(()),
-            AstNode::BreakStmt => Ok(()),
-            AstNode::ContinueStmt => Ok(()),
+            AstNode::PassStmt { .. } => Ok(()),
+            AstNode::BreakStmt { .. } => Ok(()),
+            AstNode::ContinueStmt { .. } => Ok(()),
         }
     }
 

@@ -8,3 +8,7 @@ Cargo.lock
 
 *.ast
 example/*.py
+example/*.map
+__pycache__/
+
+*.vsix

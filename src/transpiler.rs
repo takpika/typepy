@@ -5,12 +5,31 @@ use crate::parser::{
     parse_inline_expr, AstNode, BinOp, CatchBlock, Expr, LambdaBody, StringLiteralType, SwitchCase,
     VarTypeField,
 };
+use crate::token::Span;
+use serde::Serialize;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ContextKind {
     Module,
     Class,
     Function,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceMapEntry {
+    pub kind: String,
+    pub name: String,
+    pub original_line: usize,
+    pub original_column: usize,
+    pub generated_line: usize,
+    pub generated_column: usize,
+}
+
+struct MarkerInfo {
+    id: usize,
+    kind: &'static str,
+    name: Option<String>,
+    span: Span,
 }
 
 pub struct PythonTranspiler {
@@ -22,6 +41,8 @@ pub struct PythonTranspiler {
     temp_counter: usize,
     context_stack: Vec<ContextKind>,
     needs_unwrap_helper: bool,
+    markers: Vec<MarkerInfo>,
+    next_marker_id: usize,
 }
 
 impl PythonTranspiler {
@@ -35,11 +56,31 @@ impl PythonTranspiler {
             temp_counter: 0,
             context_stack: vec![ContextKind::Module],
             needs_unwrap_helper: false,
+            markers: Vec::new(),
+            next_marker_id: 0,
         }
     }
 
     fn indent(&self) -> String {
         "    ".repeat(self.indent_level)
+    }
+
+    fn marker_line(
+        &mut self,
+        kind: &'static str,
+        name: Option<String>,
+        span: Span,
+        indent: &str,
+    ) -> String {
+        let id = self.next_marker_id;
+        self.next_marker_id += 1;
+        self.markers.push(MarkerInfo {
+            id,
+            kind,
+            name,
+            span,
+        });
+        format!("{}# typepy:marker:{}\n", indent, id)
     }
 
     fn push_context(&mut self, ctx: ContextKind) {
@@ -59,13 +100,56 @@ impl PythonTranspiler {
         format!("__temp{}", self.temp_counter)
     }
 
-    pub fn transpile(&mut self, node: &AstNode) -> String {
+    fn finalize_output(&self, code_with_markers: String) -> (String, Vec<SourceMapEntry>) {
+        let marker_index: HashMap<usize, &MarkerInfo> =
+            self.markers.iter().map(|info| (info.id, info)).collect();
+        let mut pending: Vec<&MarkerInfo> = Vec::new();
+        let mut source_map = Vec::new();
+        let mut cleaned_lines: Vec<String> = Vec::new();
+        let mut generated_line = 0usize;
+
+        for line in code_with_markers.lines() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("# typepy:marker:") {
+                if let Ok(id) = rest.trim().parse::<usize>() {
+                    if let Some(info) = marker_index.get(&id) {
+                        pending.push(*info);
+                    }
+                }
+                continue;
+            }
+
+            generated_line += 1;
+            let leading_ws = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+            for info in pending.drain(..) {
+                source_map.push(SourceMapEntry {
+                    kind: info.kind.to_string(),
+                    name: info.name.clone().unwrap_or_default(),
+                    original_line: info.span.start.line,
+                    original_column: info.span.start.column + 1,
+                    generated_line,
+                    generated_column: leading_ws + 1,
+                });
+            }
+            cleaned_lines.push(line.to_string());
+        }
+
+        let mut final_code = cleaned_lines.join("\n");
+        if code_with_markers.ends_with('\n') {
+            final_code.push('\n');
+        }
+
+        (final_code, source_map)
+    }
+
+    fn transpile(&mut self, node: &AstNode) -> (String, Vec<SourceMapEntry>) {
         let body = if let AstNode::File(items) = node {
             self.transpile_statements(items)
         } else {
             self.transpile_statement(node)
         };
-        self.assemble_file(body)
+        let code_with_markers = self.assemble_file(body);
+        self.finalize_output(code_with_markers)
     }
 
     fn assemble_file(&self, body: String) -> String {
@@ -135,15 +219,16 @@ impl PythonTranspiler {
                 name,
                 members,
                 parents,
-                span: _,
+                span,
             } => {
                 let indent = self.indent();
+                let mut result = self.marker_line("ClassDef", Some(name.clone()), *span, &indent);
                 let parent_str = if parents.is_empty() {
                     String::new()
                 } else {
                     format!("({})", parents.join(", "))
                 };
-                let mut result = format!("{}class {}{}:\n", indent, name, parent_str);
+                result.push_str(&format!("{}class {}{}:\n", indent, name, parent_str));
                 self.indent_level += 1;
                 self.push_context(ContextKind::Class);
                 let body = self.transpile_statements(members);
@@ -156,14 +241,13 @@ impl PythonTranspiler {
                 self.indent_level -= 1;
                 result
             }
-            AstNode::StructDef {
-                name,
-                fields,
-                span: _,
-            } => {
+            AstNode::StructDef { name, fields, span } => {
                 self.needs_dataclass = true;
                 let indent = self.indent();
-                let mut result = format!("{}@dataclass\n{}class {}:\n", indent, indent, name);
+                let mut result = String::new();
+                result.push_str(&format!("{}@dataclass\n", indent));
+                result.push_str(&self.marker_line("StructDef", Some(name.clone()), *span, &indent));
+                result.push_str(&format!("{}class {}:\n", indent, name));
                 self.indent_level += 1;
                 if fields.is_empty() {
                     result.push_str(&format!("{}pass\n", self.indent()));
@@ -193,7 +277,7 @@ impl PythonTranspiler {
                 is_static,
                 is_private,
                 decorators,
-                span: _,
+                span,
             } => {
                 let indent = self.indent();
                 let mut result = String::new();
@@ -217,6 +301,12 @@ impl PythonTranspiler {
                 if *is_private && !python_name.starts_with('_') {
                     python_name = format!("_{}", python_name);
                 }
+                result.push_str(&self.marker_line(
+                    "FunctionDef",
+                    Some(name.clone()),
+                    *span,
+                    &indent,
+                ));
                 let mut param_strings = Vec::new();
                 let in_class = self.current_context() == ContextKind::Class;
                 let is_method = in_class && !*is_static;
@@ -264,16 +354,20 @@ impl PythonTranspiler {
                 decl_type: _,
                 is_static: _,
                 is_private: _,
-                span: _,
+                span,
             } => {
+                let indent = self.indent();
                 if let Some(init_expr) = expr {
                     if let Some(definition) =
                         self.maybe_emit_named_function_literal(name, init_expr)
                     {
-                        return definition;
+                        let mut result =
+                            self.marker_line("VarDecl", Some(name.clone()), *span, &indent);
+                        result.push_str(&definition);
+                        return result;
                     }
                 }
-                let indent = self.indent();
+                let mut result = self.marker_line("VarDecl", Some(name.clone()), *span, &indent);
                 let mut line = format!("{}{}", indent, name);
                 let expr_str = expr.as_ref().map(|e| self.transpile_expr(e));
                 if let Some(ty) = var_type.as_ref().and_then(|ty| self.render_type(ty)) {
@@ -287,19 +381,21 @@ impl PythonTranspiler {
                 } else {
                     line.push_str(" = None\n");
                 }
-                line
+                result.push_str(&line);
+                result
             }
             AstNode::EnumDef {
                 name,
                 variants,
-                span: _,
+                span,
             } => {
                 self.needs_enum = true;
                 for variant in variants {
                     self.enum_variants.insert(variant.clone(), name.clone());
                 }
                 let indent = self.indent();
-                let mut result = format!("{}class {}(Enum):\n", indent, name);
+                let mut result = self.marker_line("EnumDef", Some(name.clone()), *span, &indent);
+                result.push_str(&format!("{}class {}(Enum):\n", indent, name));
                 self.indent_level += 1;
                 if variants.is_empty() {
                     result.push_str(&format!("{}pass\n", self.indent()));
@@ -315,40 +411,47 @@ impl PythonTranspiler {
                 self.indent_level -= 1;
                 result
             }
-            AstNode::ExprStmt(expr) => match expr {
-                Expr::StringLiteral { .. } => {
-                    let indent = self.indent();
-                    format!("{}{}\n", indent, self.transpile_expr(expr))
-                }
-                Expr::CompoundAssign { op, target, value } => {
-                    let indent = self.indent();
-                    let op_str = self.binary_op_symbol(op);
-                    let target_str = self.transpile_expr(target);
-                    let value_str = self.transpile_expr(value);
-                    format!("{}{} {}= {}\n", indent, target_str, op_str, value_str)
-                }
-                _ => {
-                    if let Expr::Assign { target, value } = expr {
-                        if let Expr::Identifier { ref name, .. } = target.as_ref() {
-                            if let Some(definition) =
-                                self.maybe_emit_named_function_literal(name, value.as_ref())
-                            {
-                                return definition;
+            AstNode::ExprStmt { expr, span } => {
+                let indent = self.indent();
+                let stmt = match expr {
+                    Expr::StringLiteral { .. } => {
+                        format!("{}{}\n", indent, self.transpile_expr(expr))
+                    }
+                    Expr::CompoundAssign { op, target, value } => {
+                        let op_str = self.binary_op_symbol(op);
+                        let target_str = self.transpile_expr(target);
+                        let value_str = self.transpile_expr(value);
+                        format!("{}{} {}= {}\n", indent, target_str, op_str, value_str)
+                    }
+                    _ => {
+                        if let Expr::Assign { target, value } = expr {
+                            if let Expr::Identifier { ref name, .. } = target.as_ref() {
+                                if let Some(definition) =
+                                    self.maybe_emit_named_function_literal(name, value.as_ref())
+                                {
+                                    let mut result =
+                                        self.marker_line("ExprStmt", None, *span, &indent);
+                                    result.push_str(&definition);
+                                    return result;
+                                }
                             }
                         }
+                        let expr_str = self.transpile_expr(expr);
+                        format!("{}{}\n", indent, expr_str)
                     }
-                    let indent = self.indent();
-                    let expr_str = self.transpile_expr(expr);
-                    format!("{}{}\n", indent, expr_str)
-                }
-            },
-            AstNode::ReturnStmt(expr) => {
+                };
+                let mut result = self.marker_line("ExprStmt", None, *span, &indent);
+                result.push_str(&stmt);
+                result
+            }
+            AstNode::ReturnStmt { value, span } => {
                 let indent = self.indent();
-                match expr {
+                match value {
                     Some(Expr::Function { params, body }) => {
                         let func_name = self.new_temp();
                         let mut result =
                             self.emit_function_literal_definition(&func_name, params, body);
+                        result.push_str(&self.marker_line("ReturnStmt", None, *span, &indent));
                         result.push_str(&format!("{}return {}\n", indent, func_name));
                         result
                     }
@@ -362,23 +465,43 @@ impl PythonTranspiler {
                             let func_name = self.new_temp();
                             let mut result =
                                 self.emit_function_literal_definition(&func_name, params, block);
+                            result.push_str(&self.marker_line("ReturnStmt", None, *span, &indent));
                             result.push_str(&format!("{}return {}\n", indent, func_name));
                             result
                         } else {
-                            format!("{}return {}\n", indent, self.transpile_expr(value))
+                            let mut result = self.marker_line("ReturnStmt", None, *span, &indent);
+                            result.push_str(&format!(
+                                "{}return {}\n",
+                                indent,
+                                self.transpile_expr(value)
+                            ));
+                            result
                         }
                     }
-                    Some(value) => format!("{}return {}\n", indent, self.transpile_expr(value)),
-                    None => format!("{}return\n", indent),
+                    Some(value) => {
+                        let mut result = self.marker_line("ReturnStmt", None, *span, &indent);
+                        result.push_str(&format!(
+                            "{}return {}\n",
+                            indent,
+                            self.transpile_expr(value)
+                        ));
+                        result
+                    }
+                    None => {
+                        let mut result = self.marker_line("ReturnStmt", None, *span, &indent);
+                        result.push_str(&format!("{}return\n", indent));
+                        result
+                    }
                 }
             }
             AstNode::SwitchStmt {
                 expr,
                 cases,
                 default,
+                span,
             } => {
                 let indent = self.indent();
-                let mut result = String::new();
+                let mut result = self.marker_line("SwitchStmt", None, *span, &indent);
                 let expr_str = self.transpile_expr(expr);
                 if cases.is_empty() && default.is_none() {
                     result.push_str(&format!("{}pass\n", indent));
@@ -417,10 +540,12 @@ impl PythonTranspiler {
                 condition,
                 body,
                 else_body,
+                span,
             } => {
                 let indent = self.indent();
                 let cond_str = self.render_condition(condition);
-                let mut result = format!("{}if {}:\n", indent, cond_str);
+                let mut result = self.marker_line("IfStmt", None, *span, &indent);
+                result.push_str(&format!("{}if {}:\n", indent, cond_str));
                 self.indent_level += 1;
                 let body_str = self.transpile_statements(body);
                 if body_str.trim().is_empty() {
@@ -445,20 +570,24 @@ impl PythonTranspiler {
             AstNode::GuardStmt {
                 condition,
                 else_body,
+                span,
             } => {
                 let indent = self.indent();
-                let mut result = String::new();
-                match &**condition {
+                let mut prelude = String::new();
+                let if_line = match &**condition {
                     Expr::VarDecl { name, expr, .. } => {
                         let value = self.transpile_expr(expr);
-                        result.push_str(&format!("{}{} = {}\n", indent, name, value));
-                        result.push_str(&format!("{}if {} is None:\n", indent, name));
+                        prelude.push_str(&format!("{}{} = {}\n", indent, name, value));
+                        format!("{}if {} is None:\n", indent, name)
                     }
                     other => {
                         let cond = self.transpile_expr(other);
-                        result.push_str(&format!("{}if not ({}):\n", indent, cond));
+                        format!("{}if not ({}):\n", indent, cond)
                     }
-                }
+                };
+                let mut result = prelude;
+                result.push_str(&self.marker_line("GuardStmt", None, *span, &indent));
+                result.push_str(&if_line);
                 self.indent_level += 1;
                 if let Some(else_nodes) = else_body {
                     let else_str = self.transpile_statements(else_nodes);
@@ -477,10 +606,12 @@ impl PythonTranspiler {
                 var_name,
                 iterable,
                 body,
+                span,
             } => {
                 let indent = self.indent();
                 let iter_str = self.transpile_expr(iterable);
-                let mut result = format!("{}for {} in {}:\n", indent, var_name, iter_str);
+                let mut result = self.marker_line("ForStmt", None, *span, &indent);
+                result.push_str(&format!("{}for {} in {}:\n", indent, var_name, iter_str));
                 self.indent_level += 1;
                 let body_str = self.transpile_statements(body);
                 if body_str.trim().is_empty() {
@@ -495,9 +626,11 @@ impl PythonTranspiler {
                 body,
                 catch_blocks,
                 finally_block,
+                span,
             } => {
                 let indent = self.indent();
-                let mut result = format!("{}try:\n", indent);
+                let mut result = self.marker_line("TryStmt", None, *span, &indent);
+                result.push_str(&format!("{}try:\n", indent));
                 self.indent_level += 1;
                 let body_str = self.transpile_statements(body);
                 if body_str.trim().is_empty() {
@@ -524,14 +657,30 @@ impl PythonTranspiler {
                 }
                 result
             }
-            AstNode::ThrowStmt(expr) => {
+            AstNode::ThrowStmt { expr, span } => {
                 let indent = self.indent();
-                let value = self.transpile_expr(expr);
-                format!("{}raise {}\n", indent, value)
+                let mut result = self.marker_line("ThrowStmt", None, *span, &indent);
+                result.push_str(&format!("{}raise {}\n", indent, self.transpile_expr(expr)));
+                result
             }
-            AstNode::PassStmt => format!("{}pass\n", self.indent()),
-            AstNode::BreakStmt => format!("{}break\n", self.indent()),
-            AstNode::ContinueStmt => format!("{}continue\n", self.indent()),
+            AstNode::PassStmt { span } => {
+                let indent = self.indent();
+                let mut result = self.marker_line("PassStmt", None, *span, &indent);
+                result.push_str(&format!("{}pass\n", indent));
+                result
+            }
+            AstNode::BreakStmt { span } => {
+                let indent = self.indent();
+                let mut result = self.marker_line("BreakStmt", None, *span, &indent);
+                result.push_str(&format!("{}break\n", indent));
+                result
+            }
+            AstNode::ContinueStmt { span } => {
+                let indent = self.indent();
+                let mut result = self.marker_line("ContinueStmt", None, *span, &indent);
+                result.push_str(&format!("{}continue\n", indent));
+                result
+            }
             AstNode::File(items) => self.transpile_statements(items),
         }
     }
@@ -998,8 +1147,10 @@ impl PythonTranspiler {
     fn block_to_expression(&mut self, block: &[AstNode]) -> Option<String> {
         if block.len() == 1 {
             match &block[0] {
-                AstNode::ReturnStmt(Some(expr)) => Some(self.transpile_expr(expr)),
-                AstNode::ExprStmt(expr) => Some(self.transpile_expr(expr)),
+                AstNode::ReturnStmt {
+                    value: Some(expr), ..
+                } => Some(self.transpile_expr(expr)),
+                AstNode::ExprStmt { expr, .. } => Some(self.transpile_expr(expr)),
                 _ => None,
             }
         } else {
@@ -1151,7 +1302,13 @@ impl PythonTranspiler {
     }
 }
 
-pub fn transpile_to_python(ast: &AstNode) -> String {
+pub fn transpile_to_python_with_map(ast: &AstNode) -> (String, Vec<SourceMapEntry>) {
     let mut transpiler = PythonTranspiler::new();
     transpiler.transpile(ast)
+}
+
+#[allow(dead_code)]
+pub fn transpile_to_python(ast: &AstNode) -> String {
+    let (code, _) = transpile_to_python_with_map(ast);
+    code
 }

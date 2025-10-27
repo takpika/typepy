@@ -65,56 +65,75 @@ fn optimize_node(node: AstNode) -> AstNode {
             variants,
             span,
         },
-        AstNode::ExprStmt(expr) => AstNode::ExprStmt(optimize_expr(expr)),
-        AstNode::ReturnStmt(expr) => AstNode::ReturnStmt(expr.map(optimize_expr)),
+        AstNode::ExprStmt { expr, span } => AstNode::ExprStmt {
+            expr: optimize_expr(expr),
+            span,
+        },
+        AstNode::ReturnStmt { value, span } => AstNode::ReturnStmt {
+            value: value.map(optimize_expr),
+            span,
+        },
         AstNode::SwitchStmt {
             expr,
             cases,
             default,
+            span,
         } => AstNode::SwitchStmt {
             expr: optimize_expr(expr),
             cases: cases.into_iter().map(optimize_switch_case).collect(),
             default: default.map(|body| body.into_iter().map(optimize_node).collect()),
+            span,
         },
         AstNode::IfStmt {
             condition,
             body,
             else_body,
+            span,
         } => AstNode::IfStmt {
             condition: Box::new(optimize_expr(*condition)),
             body: body.into_iter().map(optimize_node).collect(),
             else_body: else_body.map(|stmts| stmts.into_iter().map(optimize_node).collect()),
+            span,
         },
         AstNode::GuardStmt {
             condition,
             else_body,
+            span,
         } => AstNode::GuardStmt {
             condition: Box::new(optimize_expr(*condition)),
             else_body: else_body.map(|stmts| stmts.into_iter().map(optimize_node).collect()),
+            span,
         },
         AstNode::ForStmt {
             var_name,
             iterable,
             body,
+            span,
         } => AstNode::ForStmt {
             var_name,
             iterable: optimize_expr(iterable),
             body: body.into_iter().map(optimize_node).collect(),
+            span,
         },
         AstNode::TryStmt {
             body,
             catch_blocks,
             finally_block,
+            span,
         } => AstNode::TryStmt {
             body: body.into_iter().map(optimize_node).collect(),
             catch_blocks: catch_blocks.into_iter().map(optimize_catch_block).collect(),
             finally_block: finally_block
                 .map(|stmts| stmts.into_iter().map(optimize_node).collect()),
+            span,
         },
-        AstNode::ThrowStmt(expr) => AstNode::ThrowStmt(optimize_expr(expr)),
-        AstNode::PassStmt => AstNode::PassStmt,
-        AstNode::BreakStmt => AstNode::BreakStmt,
-        AstNode::ContinueStmt => AstNode::ContinueStmt,
+        AstNode::ThrowStmt { expr, span } => AstNode::ThrowStmt {
+            expr: optimize_expr(expr),
+            span,
+        },
+        AstNode::PassStmt { span } => AstNode::PassStmt { span },
+        AstNode::BreakStmt { span } => AstNode::BreakStmt { span },
+        AstNode::ContinueStmt { span } => AstNode::ContinueStmt { span },
     }
 }
 

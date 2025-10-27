@@ -19,7 +19,7 @@ fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} [--no-std] [--check] [--emit-symbols] <filename>",
+            "Usage: {} [--no-std] [--check] [--emit-symbols] [--source-map] <filename>",
             args[0]
         );
         return Ok(());
@@ -28,6 +28,7 @@ fn main() -> io::Result<()> {
     let mut use_std = true;
     let mut check_only = false;
     let mut emit_symbols = false;
+    let mut emit_source_map = false;
     let mut filenames = Vec::new();
     for arg in args.iter().skip(1) {
         match arg.as_str() {
@@ -40,6 +41,9 @@ fn main() -> io::Result<()> {
             "--emit-symbols" => {
                 emit_symbols = true;
             }
+            "--source-map" => {
+                emit_source_map = true;
+            }
             _ => {
                 filenames.push(arg.clone());
             }
@@ -48,7 +52,7 @@ fn main() -> io::Result<()> {
 
     if filenames.is_empty() {
         eprintln!(
-            "Usage: {} [--no-std] [--check] [--emit-symbols] <filename>",
+            "Usage: {} [--no-std] [--check] [--emit-symbols] [--source-map] <filename>",
             args[0]
         );
         return Ok(());
@@ -100,10 +104,27 @@ fn main() -> io::Result<()> {
             if check_only {
                 println!("Analysis succeeded.");
             } else {
-                let python_code = transpiler::transpile_to_python(&analyzer.root_node);
+                let (python_code, source_map) =
+                    transpiler::transpile_to_python_with_map(&analyzer.root_node);
                 let output_py = Path::new(filename).with_extension("py");
-                fs::write(&output_py, python_code)?;
+                fs::write(&output_py, &python_code)?;
                 println!("Transpiled Python written to {}", output_py.display());
+
+                if emit_source_map {
+                    let output_map = output_py.with_extension("py.map");
+                    let payload = json!({
+                        "version": 1,
+                        "file": output_py
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default(),
+                        "source": filename,
+                        "mappings": source_map,
+                    });
+                    let pretty = serde_json::to_string_pretty(&payload)?;
+                    fs::write(&output_map, pretty)?;
+                    println!("Source map written to {}", output_map.display());
+                }
             }
             if emit_symbols {
                 let payload = json!({

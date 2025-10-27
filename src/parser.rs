@@ -103,45 +103,65 @@ pub enum AstNode {
     },
 
     /// 式ステートメント (例: `print("hello");`)
-    ExprStmt(Expr),
+    ExprStmt {
+        expr: Expr,
+        span: Span,
+    },
 
     /// return文 (例: `return x + 1;`)
-    ReturnStmt(Option<Expr>),
+    ReturnStmt {
+        value: Option<Expr>,
+        span: Span,
+    },
 
     SwitchStmt {
         expr: Expr,
         cases: Vec<SwitchCase>,
         default: Option<Vec<AstNode>>,
+        span: Span,
     },
 
     IfStmt {
         condition: Box<Expr>,
         body: Vec<AstNode>,
         else_body: Option<Vec<AstNode>>,
+        span: Span,
     },
 
     GuardStmt {
         condition: Box<Expr>,
         else_body: Option<Vec<AstNode>>,
+        span: Span,
     },
 
     ForStmt {
         var_name: String,
         iterable: Expr,
         body: Vec<AstNode>,
+        span: Span,
     },
 
     TryStmt {
         body: Vec<AstNode>,
         catch_blocks: Vec<CatchBlock>,
         finally_block: Option<Vec<AstNode>>,
+        span: Span,
     },
 
-    ThrowStmt(Expr),
+    ThrowStmt {
+        expr: Expr,
+        span: Span,
+    },
 
-    PassStmt,
-    BreakStmt,
-    ContinueStmt,
+    PassStmt {
+        span: Span,
+    },
+    BreakStmt {
+        span: Span,
+    },
+    ContinueStmt {
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -629,7 +649,7 @@ impl Parser {
         Ok(AstNode::File(items))
     }
 
-    fn parse_switch_stmt(&mut self) -> ParseResult<AstNode> {
+    fn parse_switch_stmt(&mut self, switch_start_span: Span) -> ParseResult<AstNode> {
         // 1) parse the expression after "switch"
         let switch_expr = self.parse_expr()?;
 
@@ -774,14 +794,16 @@ impl Parser {
             )));
         }
 
+        let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         Ok(AstNode::SwitchStmt {
             expr: switch_expr,
             cases,
             default,
+            span: Span::new(switch_start_span.start, end_span.end),
         })
     }
 
-    fn parse_try_stmt(&mut self) -> ParseResult<AstNode> {
+    fn parse_try_stmt(&mut self, try_start_span: Span) -> ParseResult<AstNode> {
         // 1) expect '{'
         if self.current_token() != Token::LBrace {
             return Err(self.error(format!(
@@ -891,14 +913,16 @@ impl Parser {
             finally_block = Some(finally_stmts);
         }
 
+        let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         Ok(AstNode::TryStmt {
             body: try_stmts,
             catch_blocks,
             finally_block,
+            span: Span::new(try_start_span.start, end_span.end),
         })
     }
 
-    fn parse_if_stmt(&mut self) -> ParseResult<AstNode> {
+    fn parse_if_stmt(&mut self, if_start_span: Span) -> ParseResult<AstNode> {
         // 1) parse the condition
         let condition = match self.current_token() {
             Token::Final | Token::Let => {
@@ -1006,14 +1030,16 @@ impl Parser {
             else_body = Some(else_stmts);
         }
 
+        let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         Ok(AstNode::IfStmt {
             condition: Box::new(condition),
             body: body_stmts,
             else_body,
+            span: Span::new(if_start_span.start, end_span.end),
         })
     }
 
-    fn parse_for_stmt(&mut self) -> ParseResult<AstNode> {
+    fn parse_for_stmt(&mut self, for_start_span: Span) -> ParseResult<AstNode> {
         // 1) expect identifier
         let var_name = match self.current_token() {
             Token::Identifier(ref s) => {
@@ -1068,14 +1094,16 @@ impl Parser {
             return Err(self.error("Missing '}' at end of for loop body"));
         }
 
+        let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         Ok(AstNode::ForStmt {
             var_name,
             iterable,
             body: body_stmts,
+            span: Span::new(for_start_span.start, end_span.end),
         })
     }
 
-    fn parse_guard_stmt(&mut self) -> ParseResult<AstNode> {
+    fn parse_guard_stmt(&mut self, guard_start_span: Span) -> ParseResult<AstNode> {
         let condition = match self.current_token() {
             Token::Final | Token::Let => {
                 let mut conditions = Vec::new();
@@ -1147,9 +1175,11 @@ impl Parser {
             return Err(self.error("Missing '}' at end of guard statement"));
         }
         self.advance();
+        let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
         Ok(AstNode::GuardStmt {
             condition: Box::new(condition),
             else_body: Some(else_elms),
+            span: Span::new(guard_start_span.start, end_span.end),
         })
     }
 
@@ -1786,13 +1816,19 @@ impl Parser {
             }
             Token::Try => {
                 self.advance(); // consume "try"
-                self.parse_try_stmt()
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                self.parse_try_stmt(start_span)
             }
             Token::Throw => {
                 self.advance(); // consume "throw"
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
                 let e = self.parse_expr()?;
                 self.expect(&Token::Semicolon)?;
-                Ok(AstNode::ThrowStmt(e))
+                let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                Ok(AstNode::ThrowStmt {
+                    expr: e,
+                    span: Span::new(start_span.start, end_span.end),
+                })
             }
             Token::Static => {
                 // consume 'static'
@@ -1842,57 +1878,87 @@ impl Parser {
             }
             Token::Return => {
                 self.advance(); // consume 'return'
-                                // return文の場合、式があるかもしれない
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                // return文の場合、式があるかもしれない
                 if self.current_token() == Token::Semicolon {
                     // `return;`
                     self.advance();
-                    Ok(AstNode::ReturnStmt(None))
+                    let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                    Ok(AstNode::ReturnStmt {
+                        value: None,
+                        span: Span::new(start_span.start, end_span.end),
+                    })
                 } else {
                     let e = self.parse_expr()?;
                     self.expect(&Token::Semicolon)?;
-                    Ok(AstNode::ReturnStmt(Some(e)))
+                    let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                    Ok(AstNode::ReturnStmt {
+                        value: Some(e),
+                        span: Span::new(start_span.start, end_span.end),
+                    })
                 }
             }
             Token::Pass => {
                 self.advance();
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
                 self.expect(&Token::Semicolon)?;
-                Ok(AstNode::PassStmt)
+                let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                Ok(AstNode::PassStmt {
+                    span: Span::new(start_span.start, end_span.end),
+                })
             }
             Token::Break => {
                 self.advance();
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
                 self.expect(&Token::Semicolon)?;
-                Ok(AstNode::BreakStmt)
+                let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                Ok(AstNode::BreakStmt {
+                    span: Span::new(start_span.start, end_span.end),
+                })
             }
             Token::Continue => {
                 self.advance();
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
                 self.expect(&Token::Semicolon)?;
-                Ok(AstNode::ContinueStmt)
+                let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                Ok(AstNode::ContinueStmt {
+                    span: Span::new(start_span.start, end_span.end),
+                })
             }
             Token::Switch => {
                 self.advance(); // consume 'switch'
-                self.parse_switch_stmt()
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                self.parse_switch_stmt(start_span)
             }
             Token::If => {
                 self.advance(); // consume 'if'
-                self.parse_if_stmt()
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                self.parse_if_stmt(start_span)
             }
             Token::For => {
                 self.advance(); // consume 'for'
-                self.parse_for_stmt()
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                self.parse_for_stmt(start_span)
             }
             Token::Guard => {
                 self.advance();
-                self.parse_guard_stmt()
+                let start_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                self.parse_guard_stmt(start_span)
             }
             Token::Eof => Err(self.error("Unexpected EOF")),
             _ => {
                 // 式ステートメントとみなす
+                let start_span = self.current_span().unwrap_or_else(|| self.fallback_span());
                 let expr = self.parse_expr()?;
                 // optional semicolon
                 if self.current_token() == Token::Semicolon {
                     self.advance();
                 }
-                Ok(AstNode::ExprStmt(expr))
+                let end_span = self.previous_span().unwrap_or_else(|| self.fallback_span());
+                Ok(AstNode::ExprStmt {
+                    expr,
+                    span: Span::new(start_span.start, end_span.end),
+                })
             }
         }
     }

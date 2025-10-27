@@ -5,6 +5,7 @@ const path = require("path");
 const fs = require("fs");
 const cp = require("child_process");
 const crypto = require("crypto");
+const os = require("os");
 
 const KEYWORDS = [
   "if",
@@ -96,6 +97,690 @@ const symbolCache = new Map();
 const pendingChangeTimers = new Map();
 const runningAnalyses = new Set();
 const tempFileRegistry = new Map();
+
+const DEFAULT_DEBUG_PYTHON = process.platform === "win32" ? "python" : "python3";
+
+function normalizeFsPath(filePath) {
+  if (!filePath) {
+    return null;
+  }
+  const resolved = path.isAbsolute(filePath) ? filePath : path.resolve(filePath);
+  const normalized = path.normalize(resolved);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function countFileLines(filePath) {
+  try {
+    const content = fs.readFileSync(filePath, "utf8");
+    if (content.length === 0) {
+      return 0;
+    }
+    const matches = content.match(/\r\n|\r|\n/g);
+    const lineBreaks = matches ? matches.length : 0;
+    return lineBreaks + 1;
+  } catch (error) {
+    console.warn(`TypePy: Failed to count lines for ${filePath}: ${error.message}`);
+    return 0;
+  }
+}
+
+class FileMapping {
+  constructor(typepyPath, pythonPath, rawMappings) {
+    this.typepyPath = typepyPath;
+    this.pythonPath = pythonPath;
+    this.normalizedTypepyPath = normalizeFsPath(typepyPath);
+    this.normalizedPythonPath = normalizeFsPath(pythonPath);
+    this.maxOriginalLine = countFileLines(typepyPath);
+    this.maxGeneratedLine = countFileLines(pythonPath);
+    this.originalAnchors = [];
+    this.generatedAnchors = [];
+
+    if (Array.isArray(rawMappings)) {
+      rawMappings
+        .filter((entry) =>
+          Number.isFinite(entry.original_line) && Number.isFinite(entry.generated_line)
+        )
+        .forEach((entry) => {
+          const original = Math.max(1, Math.floor(entry.original_line));
+          const generated = Math.max(1, Math.floor(entry.generated_line));
+          this.originalAnchors.push({ original, generated });
+          this.generatedAnchors.push({ original, generated });
+        });
+    }
+
+    this.originalAnchors.sort((a, b) => a.original - b.original);
+    this.generatedAnchors.sort((a, b) => a.generated - b.generated);
+  }
+
+  clampGenerated(line) {
+    if (this.maxGeneratedLine > 0) {
+      return Math.max(1, Math.min(line, this.maxGeneratedLine));
+    }
+    return Math.max(1, line);
+  }
+
+  clampOriginal(line) {
+    if (this.maxOriginalLine > 0) {
+      return Math.max(1, Math.min(line, this.maxOriginalLine));
+    }
+    return Math.max(1, line);
+  }
+
+  originalToGenerated(line) {
+    if (!Number.isFinite(line)) {
+      return line;
+    }
+    if (this.originalAnchors.length === 0) {
+      return this.clampGenerated(line);
+    }
+    let anchor = this.originalAnchors[0];
+    for (const candidate of this.originalAnchors) {
+      if (candidate.original > line) {
+        break;
+      }
+      anchor = candidate;
+    }
+    const offset = anchor.generated - anchor.original;
+    return this.clampGenerated(line + offset);
+  }
+
+  generatedToOriginal(line) {
+    if (!Number.isFinite(line)) {
+      return line;
+    }
+    if (this.generatedAnchors.length === 0) {
+      return this.clampOriginal(line);
+    }
+    let anchor = this.generatedAnchors[0];
+    for (const candidate of this.generatedAnchors) {
+      if (candidate.generated > line) {
+        break;
+      }
+      anchor = candidate;
+    }
+    const offset = anchor.original - anchor.generated;
+    return this.clampOriginal(line + offset);
+  }
+}
+
+class SourceMapRegistry {
+  constructor(outputChannel) {
+    this.outputChannel = outputChannel;
+    this.mappingsByTypepy = new Map();
+    this.mappingsByPython = new Map();
+  }
+
+  registerFromPayload(typepyPath, pythonPath, sourceMapPayload) {
+    try {
+      const mapping = new FileMapping(typepyPath, pythonPath, sourceMapPayload?.mappings || []);
+      if (mapping.originalAnchors.length === 0) {
+        this.outputChannel.appendLine(
+          `TypePy Debug: Source map for ${typepyPath} is sparse; breakpoint mapping may be approximate.`
+        );
+      }
+      this.mappingsByTypepy.set(mapping.normalizedTypepyPath, mapping);
+      this.mappingsByPython.set(mapping.normalizedPythonPath, mapping);
+    } catch (error) {
+      this.outputChannel.appendLine(
+        `TypePy Debug: Failed to register source map for ${typepyPath}: ${error.message}`
+      );
+    }
+  }
+
+  getMappingForTypePy(typepyPath) {
+    return this.mappingsByTypepy.get(normalizeFsPath(typepyPath));
+  }
+
+  getMappingForPython(pythonPath) {
+    return this.mappingsByPython.get(normalizeFsPath(pythonPath));
+  }
+
+  mapOriginalToGenerated(typepyPath, line) {
+    const mapping = this.getMappingForTypePy(typepyPath);
+    if (!mapping) {
+      return null;
+    }
+    return {
+      path: mapping.pythonPath,
+      line: mapping.originalToGenerated(line)
+    };
+  }
+
+  mapGeneratedToOriginal(pythonPath, line) {
+    const mapping = this.getMappingForPython(pythonPath);
+    if (!mapping) {
+      return null;
+    }
+    return {
+      path: mapping.typepyPath,
+      line: mapping.generatedToOriginal(line)
+    };
+  }
+}
+
+class DapMessageReader {
+  constructor(onMessage) {
+    this.onMessage = onMessage;
+    this.buffer = Buffer.alloc(0);
+    this.expectedLength = null;
+  }
+
+  handleData(chunk) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    while (true) {
+      if (this.expectedLength === null) {
+        const separatorIndex = this.buffer.indexOf("\r\n\r\n");
+        if (separatorIndex === -1) {
+          return;
+        }
+        const header = this.buffer.slice(0, separatorIndex).toString("utf8");
+        const match = /Content-Length: *(\d+)/i.exec(header);
+        if (!match) {
+          throw new Error(`Invalid DAP header: ${header}`);
+        }
+        this.expectedLength = parseInt(match[1], 10);
+        this.buffer = this.buffer.slice(separatorIndex + 4);
+      }
+
+      if (this.buffer.length < this.expectedLength) {
+        return;
+      }
+
+      const messageBuffer = this.buffer.slice(0, this.expectedLength);
+      this.buffer = this.buffer.slice(this.expectedLength);
+      this.expectedLength = null;
+
+      const messageText = messageBuffer.toString("utf8");
+      let message;
+      try {
+        message = JSON.parse(messageText);
+      } catch (error) {
+        console.error("TypePy Debug: Failed to parse DAP message", error);
+        continue;
+      }
+      this.onMessage(message);
+    }
+  }
+}
+
+function sendDapMessage(stream, message) {
+  if (!stream.writable) {
+    return;
+  }
+  const payload = JSON.stringify(message);
+  const header = `Content-Length: ${Buffer.byteLength(payload, "utf8")}\r\n\r\n`;
+  stream.write(header, "utf8");
+  stream.write(payload, "utf8");
+}
+
+class TypePyDebugAdapter {
+  constructor(sessionConfiguration, outputChannel) {
+    this.outputChannel = outputChannel;
+    this.sessionConfiguration = sessionConfiguration;
+    this.onDidSendMessageEmitter = new vscode.EventEmitter();
+    this.onDidSendMessage = this.onDidSendMessageEmitter.event;
+    this.pendingRequests = new Map();
+    this.sourceMaps = new SourceMapRegistry(outputChannel);
+    this.disposed = false;
+    this.sequenceCounter = 1;
+    this.startError = null;
+
+    this.typepyInfo = sessionConfiguration.__typepy || {};
+    this.debugpyProcess = null;
+    this.debugpyReader = null;
+
+    this.loadSourceMap();
+    this.startDebugpyAdapter();
+  }
+
+  loadSourceMap() {
+    const mapPath = this.typepyInfo.mapPath;
+    if (!mapPath) {
+      return;
+    }
+    try {
+      const content = fs.readFileSync(mapPath, "utf8");
+      const payload = JSON.parse(content);
+      this.sourceMaps.registerFromPayload(
+        this.typepyInfo.programPath,
+        this.typepyInfo.pythonPath,
+        payload
+      );
+    } catch (error) {
+      this.outputChannel.appendLine(
+        `TypePy Debug: Failed to read source map ${mapPath}: ${error.message}`
+      );
+    }
+  }
+
+  startDebugpyAdapter() {
+    const pythonExecutable = this.typepyInfo.pythonInterpreter || DEFAULT_DEBUG_PYTHON;
+    this.outputChannel.appendLine(
+      `TypePy Debug: Launching debugpy adapter with ${pythonExecutable}`
+    );
+    try {
+      this.debugpyProcess = cp.spawn(pythonExecutable, ["-m", "debugpy.adapter"], {
+        cwd: this.typepyInfo.cwd,
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+    } catch (error) {
+      this.startError = error;
+      this.outputChannel.appendLine(
+        `TypePy Debug: Failed to spawn debugpy.adapter: ${error.message}`
+      );
+      vscode.window.showErrorMessage(
+        "TypePy: Failed to start debugpy adapter. Please verify that debugpy is installed."
+      );
+      return;
+    }
+
+    this.debugpyProcess.on("error", (error) => {
+      this.outputChannel.appendLine(
+        `TypePy Debug: debugpy.adapter process error: ${error.message}`
+      );
+    });
+
+    this.debugpyProcess.on("exit", (code, signal) => {
+      const suffix = signal ? `signal ${signal}` : `code ${code}`;
+      this.outputChannel.appendLine(`TypePy Debug: debugpy.adapter exited with ${suffix}`);
+    });
+
+    this.debugpyReader = new DapMessageReader((message) => {
+      this.handleServerMessage(message);
+    });
+
+    this.debugpyProcess.stdout.on("data", (chunk) => {
+      try {
+        this.debugpyReader.handleData(chunk);
+      } catch (error) {
+        this.outputChannel.appendLine(
+          `TypePy Debug: Failed to handle debugpy message: ${error.message}`
+        );
+      }
+    });
+
+    this.debugpyProcess.stderr.on("data", (chunk) => {
+      this.outputChannel.append(chunk.toString());
+    });
+  }
+
+  handleMessage(message) {
+    if (this.disposed) {
+      return;
+    }
+
+    if (this.startError) {
+      if (message.type === "request") {
+        const failureResponse = {
+          type: "response",
+          seq: this.sequenceCounter++,
+          command: message.command,
+          request_seq: message.seq,
+          success: false,
+          message: `TypePy debug adapter failed to start: ${this.startError.message}`
+        };
+        this.onDidSendMessageEmitter.fire(failureResponse);
+      }
+      return;
+    }
+
+    if (!this.debugpyProcess || !this.debugpyProcess.stdin.writable) {
+      return;
+    }
+
+    const metadata = { command: message.command };
+    const forwarded = this.transformClientMessage(message, metadata);
+
+    if (message.type === "request") {
+      this.pendingRequests.set(message.seq, metadata);
+    }
+
+    sendDapMessage(this.debugpyProcess.stdin, forwarded);
+  }
+
+  transformClientMessage(message, metadata) {
+    if (message.type !== "request") {
+      return message;
+    }
+
+    if (message.command === "setBreakpoints") {
+      const args = { ...message.arguments };
+      if (args && args.source && args.source.path) {
+        const originalSourcePath = args.source.path;
+        const newArgs = { ...args };
+        const newSource = { ...args.source };
+        const breakpoints = Array.isArray(args.breakpoints)
+          ? args.breakpoints.map((bp) => ({ ...bp }))
+          : [];
+
+        let mappedSourcePath = null;
+        breakpoints.forEach((bp, index) => {
+          const mapped = this.sourceMaps.mapOriginalToGenerated(originalSourcePath, bp.line);
+          if (mapped) {
+            breakpoints[index].line = mapped.line;
+            mappedSourcePath = mapped.path || mappedSourcePath;
+          }
+        });
+
+        if (mappedSourcePath) {
+          newSource.path = mappedSourcePath;
+          newSource.name = path.basename(mappedSourcePath);
+        }
+
+        newArgs.source = newSource;
+        newArgs.breakpoints = breakpoints;
+        metadata.typepySource = originalSourcePath;
+        metadata.pythonSource = mappedSourcePath || originalSourcePath;
+        return {
+          ...message,
+          arguments: newArgs
+        };
+      }
+      return message;
+    }
+
+    if (message.command === "launch") {
+      const args = { ...message.arguments };
+      const pythonPath = this.typepyInfo.pythonPath;
+      if (pythonPath) {
+        args.program = pythonPath;
+      }
+      if (!args.cwd) {
+        args.cwd = this.typepyInfo.cwd || path.dirname(pythonPath || "");
+      }
+      const interpreter = this.typepyInfo.pythonInterpreter;
+      const hasPython = args.python !== undefined && args.python !== null && args.python !== "";
+      const hasPythonPath =
+        args.pythonPath !== undefined && args.pythonPath !== null && args.pythonPath !== "";
+      if (interpreter && !hasPython && !hasPythonPath) {
+        args.python = interpreter;
+      }
+      if (!args.console) {
+        args.console = "integratedTerminal";
+      }
+      return {
+        ...message,
+        arguments: args
+      };
+    }
+
+    return message;
+  }
+
+  handleServerMessage(message) {
+    if (message.type === "response" && this.pendingRequests.has(message.request_seq)) {
+      const metadata = this.pendingRequests.get(message.request_seq);
+      if (metadata.command === "setBreakpoints") {
+        this.transformBreakpointResponse(message, metadata);
+      } else if (metadata.command === "stackTrace") {
+        this.transformStackTraceResponse(message);
+      }
+      this.pendingRequests.delete(message.request_seq);
+    } else if (message.type === "event" && message.event === "output") {
+      const bodyText = message.body && message.body.output ? message.body.output : "";
+      if (bodyText) {
+        this.outputChannel.append(bodyText);
+      }
+    }
+
+    this.onDidSendMessageEmitter.fire(message);
+  }
+
+  transformBreakpointResponse(message, metadata) {
+    if (!message.body || !Array.isArray(message.body.breakpoints)) {
+      return;
+    }
+    const pythonSource = metadata.pythonSource;
+    const typepySource = metadata.typepySource;
+    if (!pythonSource || !typepySource) {
+      return;
+    }
+    message.body.breakpoints = message.body.breakpoints.map((bp) => {
+      const mapped = this.sourceMaps.mapGeneratedToOriginal(pythonSource, bp.line);
+      if (mapped) {
+        const source = { ...(bp.source || {}) };
+        source.path = typepySource;
+        source.name = path.basename(typepySource);
+        source.origin = "TypePy";
+        bp.source = source;
+        bp.line = mapped.line;
+      }
+      return bp;
+    });
+  }
+
+  transformStackTraceResponse(message) {
+    if (!message.body || !Array.isArray(message.body.stackFrames)) {
+      return;
+    }
+    message.body.stackFrames = message.body.stackFrames.map((frame) => {
+      if (!frame || !frame.source || !frame.source.path) {
+        return frame;
+      }
+      const mapped = this.sourceMaps.mapGeneratedToOriginal(frame.source.path, frame.line);
+      if (!mapped) {
+        return frame;
+      }
+      const updatedSource = { ...frame.source };
+      updatedSource.path = mapped.path;
+      updatedSource.name = path.basename(mapped.path);
+      updatedSource.origin = "TypePy";
+      frame.source = updatedSource;
+      frame.line = mapped.line;
+      return frame;
+    });
+  }
+
+  dispose() {
+    this.disposed = true;
+    if (this.debugpyProcess) {
+      this.debugpyProcess.stdin?.end();
+      if (!this.debugpyProcess.killed) {
+        this.debugpyProcess.kill();
+      }
+    }
+    this.onDidSendMessageEmitter.dispose();
+  }
+}
+
+class TypePyDebugAdapterFactory {
+  constructor(outputChannel) {
+    this.outputChannel = outputChannel;
+  }
+
+  createDebugAdapterDescriptor(session) {
+    const adapter = new TypePyDebugAdapter(session.configuration, this.outputChannel);
+    return new vscode.DebugAdapterInlineImplementation(adapter);
+  }
+
+  dispose() {}
+}
+
+class TypePyDebugConfigurationProvider {
+  constructor(outputChannel) {
+    this.outputChannel = outputChannel;
+  }
+
+  resolveProgramPath(folder, rawProgram) {
+    let programPath = rawProgram;
+
+    if (!programPath) {
+      const editor = vscode.window.activeTextEditor;
+      if (editor && editor.document.languageId === "typepy") {
+        return editor.document.fileName;
+      }
+      return null;
+    }
+
+    const editor = vscode.window.activeTextEditor;
+    if (programPath.includes("${file}")) {
+      if (editor && editor.document.languageId === "typepy") {
+        programPath = programPath.replace(/\$\{file\}/g, editor.document.fileName);
+      } else {
+        return null;
+      }
+    }
+
+    const workspacePath = folder
+      ? folder.uri.fsPath
+      : vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0
+      ? vscode.workspace.workspaceFolders[0].uri.fsPath
+      : null;
+
+    if (workspacePath) {
+      programPath = programPath
+        .replace(/\$\{workspaceFolder\}/g, workspacePath)
+        .replace(/\$\{workspaceRoot\}/g, workspacePath);
+    }
+
+    if (programPath.startsWith("~")) {
+      programPath = path.join(os.homedir(), programPath.slice(1));
+    }
+    if (!path.isAbsolute(programPath)) {
+      const base = workspacePath || process.cwd();
+      programPath = path.resolve(base, programPath);
+    }
+    return programPath;
+  }
+
+  findOpenDocument(programPath) {
+    const normalized = normalizeFsPath(programPath);
+    return vscode.workspace.textDocuments.find(
+      (doc) => normalizeFsPath(doc.uri.fsPath) === normalized
+    );
+  }
+
+  async ensureTranspiled(document, programPath) {
+    const typepyUri = vscode.Uri.file(programPath);
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(typepyUri);
+    if (!workspaceFolder) {
+      vscode.window.showErrorMessage(
+        "TypePy: Debugging requires the file to be within a workspace folder."
+      );
+      return null;
+    }
+
+    const config = vscode.workspace.getConfiguration("typepy", typepyUri);
+    const commandInfo = await resolveAnalyzerCommand(document, config, {
+      includeCheck: false,
+      includeEmitSymbols: false,
+      additionalArgs: ["--source-map"]
+    });
+    if (!commandInfo) {
+      return null;
+    }
+
+    const args = [...commandInfo.args, programPath];
+    this.outputChannel.appendLine(`$ ${commandInfo.command} ${args.join(" ")}`);
+    const result = await runProcess(commandInfo.command, args, commandInfo.cwd);
+    if (result.stdout.trim().length > 0) {
+      this.outputChannel.appendLine(result.stdout.trimEnd());
+    }
+    if (result.stderr.trim().length > 0) {
+      this.outputChannel.appendLine(result.stderr.trimEnd());
+    }
+    if (result.code !== 0 || result.error) {
+      vscode.window.showErrorMessage(
+        "TypePy: Transpilation failed. See TypePy Debug output for details."
+      );
+      return null;
+    }
+
+    return {
+      workspaceFolder,
+      commandInfo
+    };
+  }
+
+  async resolveDebugConfiguration(folder, config) {
+    const resolvedConfig = { ...config };
+    resolvedConfig.type = resolvedConfig.type || "typepy";
+    resolvedConfig.request = resolvedConfig.request || "launch";
+    resolvedConfig.name = resolvedConfig.name || "TypePy: Launch";
+
+    const programPath = this.resolveProgramPath(folder, resolvedConfig.program);
+    if (!programPath) {
+      vscode.window.showErrorMessage(
+        "TypePy: Unable to determine the program to debug. Please specify the program path."
+      );
+      return null;
+    }
+
+    try {
+      await fs.promises.access(programPath, fs.constants.R_OK);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `TypePy: Program file not found or inaccessible: ${programPath}`
+      );
+      return null;
+    }
+
+    let document = this.findOpenDocument(programPath);
+    if (!document) {
+      try {
+        document = await vscode.workspace.openTextDocument(programPath);
+      } catch (error) {
+        vscode.window.showErrorMessage(
+          `TypePy: Failed to open program file for debugging: ${error.message}`
+        );
+        return null;
+      }
+    }
+
+    if (document.isDirty) {
+      const saved = await document.save();
+      if (!saved) {
+        vscode.window.showWarningMessage("TypePy: Debugging cancelled because file was not saved.");
+        return null;
+      }
+    }
+
+    const transpileResult = await this.ensureTranspiled(document, programPath);
+    if (!transpileResult) {
+      return null;
+    }
+
+    const parsedProgram = path.parse(programPath);
+    const pythonPath = path.join(parsedProgram.dir, `${parsedProgram.name}.py`);
+    const mapPath = `${pythonPath}.map`;
+
+    try {
+      await fs.promises.access(pythonPath, fs.constants.R_OK);
+    } catch (error) {
+      vscode.window.showErrorMessage(
+        `TypePy: Generated Python file not found: ${pythonPath}`
+      );
+      return null;
+    }
+
+    try {
+      await fs.promises.access(mapPath, fs.constants.R_OK);
+    } catch (error) {
+      vscode.window.showWarningMessage(
+        `TypePy: Source map not found for ${programPath}. Breakpoint mapping may be unavailable.`
+      );
+    }
+
+    const typepyConfig = vscode.workspace.getConfiguration(
+      "typepy",
+      vscode.Uri.file(programPath)
+    );
+    const interpreter =
+      resolvedConfig.pythonPath ||
+      typepyConfig.get("debug.pythonPath") ||
+      DEFAULT_DEBUG_PYTHON;
+
+    resolvedConfig.__typepy = {
+      programPath,
+      pythonPath,
+      mapPath,
+      pythonInterpreter: interpreter,
+      cwd: resolvedConfig.cwd || parsedProgram.dir
+    };
+
+    return resolvedConfig;
+  }
+}
 
 function createKeywordCompletion(word) {
   const item = new vscode.CompletionItem(word, vscode.CompletionItemKind.Keyword);
@@ -420,7 +1105,7 @@ async function fileExists(filePath) {
   }
 }
 
-async function resolveAnalyzerCommand(document, config) {
+async function resolveAnalyzerCommand(document, config, options = {}) {
   const overrideCommand = (config.get("analyzer.command") || "").trim();
   const extraArgs = config.get("analyzer.args") || [];
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
@@ -428,14 +1113,28 @@ async function resolveAnalyzerCommand(document, config) {
     return null;
   }
 
-  const ensureEmitSymbols = (args) =>
-    args.includes("--emit-symbols") ? args : [...args, "--emit-symbols"];
+  const includeCheck = options.includeCheck !== false;
+  const includeEmitSymbols = options.includeEmitSymbols !== false;
+  const additionalArgs = options.additionalArgs || [];
+
+  const mergedArgs = [];
+  if (includeCheck) {
+    mergedArgs.push("--check");
+  }
+  mergedArgs.push(...extraArgs);
+  mergedArgs.push(...additionalArgs);
+
+  const finalArgs = includeEmitSymbols
+    ? mergedArgs.includes("--emit-symbols")
+      ? mergedArgs.slice()
+      : [...mergedArgs, "--emit-symbols"]
+    : mergedArgs.filter((arg) => arg !== "--emit-symbols");
 
   if (overrideCommand.length > 0) {
     return {
       cwd: workspaceFolder.uri.fsPath,
       command: overrideCommand,
-      args: ensureEmitSymbols([...extraArgs])
+      args: finalArgs.slice()
     };
   }
 
@@ -445,14 +1144,14 @@ async function resolveAnalyzerCommand(document, config) {
     return {
       cwd: workspaceFolder.uri.fsPath,
       command: localBinary,
-      args: ensureEmitSymbols(["--check", ...extraArgs])
+      args: finalArgs.slice()
     };
   }
 
   return {
     cwd: workspaceFolder.uri.fsPath,
     command: "cargo",
-    args: ensureEmitSymbols(["run", "--quiet", "--", "--check", ...extraArgs])
+    args: ["run", "--quiet", "--", ...finalArgs]
   };
 }
 
@@ -678,8 +1377,26 @@ async function triggerAnalysisForDocument(document, diagnosticsCollection, outpu
 function activate(context) {
   const diagnosticsCollection = vscode.languages.createDiagnosticCollection("typepy");
   const outputChannel = vscode.window.createOutputChannel("TypePy Analyzer");
+  const debugOutputChannel = vscode.window.createOutputChannel("TypePy Debug");
+  const debugConfigProvider = new TypePyDebugConfigurationProvider(debugOutputChannel);
+  const debugAdapterFactory = new TypePyDebugAdapterFactory(debugOutputChannel);
 
-  context.subscriptions.push(diagnosticsCollection, outputChannel);
+  const debugConfigRegistration = vscode.debug.registerDebugConfigurationProvider(
+    "typepy",
+    debugConfigProvider
+  );
+  const debugAdapterRegistration = vscode.debug.registerDebugAdapterDescriptorFactory(
+    "typepy",
+    debugAdapterFactory
+  );
+
+  context.subscriptions.push(
+    diagnosticsCollection,
+    outputChannel,
+    debugOutputChannel,
+    debugConfigRegistration,
+    debugAdapterRegistration
+  );
 
   const analyzeCommand = vscode.commands.registerCommand("typepy.analyzeFile", async () => {
     const editor = vscode.window.activeTextEditor;

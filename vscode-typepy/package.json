@@ -17,7 +17,8 @@
   ],
   "activationEvents": [
     "onLanguage:typepy",
-    "onCommand:typepy.analyzeFile"
+    "onCommand:typepy.analyzeFile",
+    "onDebugResolve:typepy"
   ],
   "contributes": {
     "languages": [
@@ -44,6 +45,59 @@
       {
         "command": "typepy.analyzeFile",
         "title": "TypePy: Analyze Current File"
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "typepy"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "typepy",
+        "label": "TypePy Debugger",
+        "languages": [
+          "typepy"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "default": "${file}",
+                "description": "Entry TypePy source file to launch."
+              },
+              "args": {
+                "type": "array",
+                "default": [],
+                "items": {
+                  "type": "string"
+                },
+                "description": "Arguments passed to the generated Python program."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for the debug session. Defaults to the program folder."
+              },
+              "pythonPath": {
+                "type": "string",
+                "description": "Python interpreter used to run debugpy. Must have debugpy available."
+              }
+            },
+            "required": [
+              "program"
+            ]
+          }
+        },
+        "initialConfigurations": [
+          {
+            "name": "TypePy: Launch",
+            "type": "typepy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+          }
+        ]
       }
     ],
     "configuration": {
@@ -77,6 +131,11 @@
           "default": 700,
           "minimum": 100,
           "description": "Delay in milliseconds before running the analyzer after edits when runOnChange is enabled."
+        },
+        "typepy.debug.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python interpreter used for TypePy debugging (must have debugpy available). Leave empty to use the system default."
         }
       }
     }
