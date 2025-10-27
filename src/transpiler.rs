@@ -8,6 +8,18 @@ use crate::parser::{
 use crate::token::Span;
 use serde::Serialize;
 
+#[derive(Clone, Default)]
+pub struct TypePyModuleBinding {
+    pub member_map: HashMap<String, String>,
+}
+
+#[derive(Clone, Default)]
+pub struct TypePyTranspileContext {
+    pub module_aliases: HashMap<String, TypePyModuleBinding>,
+    pub from_import_modules: HashSet<String>,
+    pub export_renames: HashMap<String, String>,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ContextKind {
     Module,
@@ -15,10 +27,12 @@ enum ContextKind {
     Function,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SourceMapEntry {
     pub kind: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_file: Option<String>,
     pub original_line: usize,
     pub original_column: usize,
     pub generated_line: usize,
@@ -43,10 +57,16 @@ pub struct PythonTranspiler {
     needs_unwrap_helper: bool,
     markers: Vec<MarkerInfo>,
     next_marker_id: usize,
+    typepy_context: Option<TypePyTranspileContext>,
 }
 
 impl PythonTranspiler {
+    #[allow(dead_code)]
     pub fn new() -> Self {
+        Self::with_typepy_context(None)
+    }
+
+    pub fn with_typepy_context(ctx: Option<TypePyTranspileContext>) -> Self {
         Self {
             indent_level: 0,
             typing_imports: HashSet::new(),
@@ -58,6 +78,7 @@ impl PythonTranspiler {
             needs_unwrap_helper: false,
             markers: Vec::new(),
             next_marker_id: 0,
+            typepy_context: ctx,
         }
     }
 
@@ -95,6 +116,51 @@ impl PythonTranspiler {
         *self.context_stack.last().unwrap_or(&ContextKind::Module)
     }
 
+    fn should_skip_import_alias(&self, alias: &str) -> bool {
+        if let Some(ctx) = &self.typepy_context {
+            ctx.module_aliases.contains_key(alias)
+        } else {
+            false
+        }
+    }
+
+    fn should_skip_from_import(&self, module: &str) -> bool {
+        if let Some(ctx) = &self.typepy_context {
+            ctx.from_import_modules.contains(module)
+        } else {
+            false
+        }
+    }
+
+    fn resolve_module_member(&self, target: &Expr, member: &str) -> Option<String> {
+        if let Some(ctx) = &self.typepy_context {
+            if let Expr::Identifier { name, .. } = target {
+                if let Some(binding) = ctx.module_aliases.get(name) {
+                    if let Some(mapped) = binding.member_map.get(member) {
+                        return Some(mapped.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn export_rename(&self, original: &str) -> Option<String> {
+        if self.current_context() == ContextKind::Module {
+            if let Some(ctx) = &self.typepy_context {
+                if let Some(mapped) = ctx.export_renames.get(original) {
+                    return Some(mapped.clone());
+                }
+            }
+        }
+        None
+    }
+
+    fn export_python_name(&self, original: &str) -> String {
+        self.export_rename(original)
+            .unwrap_or_else(|| original.to_string())
+    }
+
     fn new_temp(&mut self) -> String {
         self.temp_counter += 1;
         format!("__temp{}", self.temp_counter)
@@ -125,6 +191,7 @@ impl PythonTranspiler {
                 source_map.push(SourceMapEntry {
                     kind: info.kind.to_string(),
                     name: info.name.clone().unwrap_or_default(),
+                    original_file: None,
                     original_line: info.span.start.line,
                     original_column: info.span.start.column + 1,
                     generated_line,
@@ -201,18 +268,38 @@ impl PythonTranspiler {
         match node {
             AstNode::Import { module, names } => {
                 let indent = self.indent();
-                let joined = names
-                    .iter()
-                    .map(|item| match &item.as_name {
-                        Some(alias) => format!("{} as {}", item.name, alias),
-                        None => item.name.clone(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 if let Some(module_name) = module {
+                    if self.should_skip_from_import(module_name) {
+                        return String::new();
+                    }
+                    let joined = names
+                        .iter()
+                        .map(|item| match &item.as_name {
+                            Some(alias) => format!("{} as {}", item.name, alias),
+                            None => item.name.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     format!("{}from {} import {}\n", indent, module_name, joined)
                 } else {
-                    format!("{}import {}\n", indent, joined)
+                    let filtered: Vec<String> = names
+                        .iter()
+                        .filter_map(|item| {
+                            let alias = item.as_name.as_ref().unwrap_or(&item.name);
+                            if self.should_skip_import_alias(alias) {
+                                None
+                            } else if let Some(as_name) = &item.as_name {
+                                Some(format!("{} as {}", item.name, as_name))
+                            } else {
+                                Some(item.name.clone())
+                            }
+                        })
+                        .collect();
+                    if filtered.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}import {}\n", indent, filtered.join(", "))
+                    }
                 }
             }
             AstNode::ClassDef {
@@ -228,7 +315,8 @@ impl PythonTranspiler {
                 } else {
                     format!("({})", parents.join(", "))
                 };
-                result.push_str(&format!("{}class {}{}:\n", indent, name, parent_str));
+                let python_name = self.export_python_name(name);
+                result.push_str(&format!("{}class {}{}:\n", indent, python_name, parent_str));
                 self.indent_level += 1;
                 self.push_context(ContextKind::Class);
                 let body = self.transpile_statements(members);
@@ -247,7 +335,8 @@ impl PythonTranspiler {
                 let mut result = String::new();
                 result.push_str(&format!("{}@dataclass\n", indent));
                 result.push_str(&self.marker_line("StructDef", Some(name.clone()), *span, &indent));
-                result.push_str(&format!("{}class {}:\n", indent, name));
+                let python_name = self.export_python_name(name);
+                result.push_str(&format!("{}class {}:\n", indent, python_name));
                 self.indent_level += 1;
                 if fields.is_empty() {
                     result.push_str(&format!("{}pass\n", self.indent()));
@@ -297,8 +386,9 @@ impl PythonTranspiler {
                         result.push_str(&format!("{}@{}({})\n", indent, decorator.name, args));
                     }
                 }
-                let mut python_name = name.clone();
-                if *is_private && !python_name.starts_with('_') {
+                let export_name = self.export_rename(name);
+                let mut python_name = export_name.clone().unwrap_or_else(|| name.clone());
+                if *is_private && export_name.is_none() && !python_name.starts_with('_') {
                     python_name = format!("_{}", python_name);
                 }
                 result.push_str(&self.marker_line(
@@ -357,9 +447,10 @@ impl PythonTranspiler {
                 span,
             } => {
                 let indent = self.indent();
+                let python_name = self.export_python_name(name);
                 if let Some(init_expr) = expr {
                     if let Some(definition) =
-                        self.maybe_emit_named_function_literal(name, init_expr)
+                        self.maybe_emit_named_function_literal(&python_name, init_expr)
                     {
                         let mut result =
                             self.marker_line("VarDecl", Some(name.clone()), *span, &indent);
@@ -368,7 +459,7 @@ impl PythonTranspiler {
                     }
                 }
                 let mut result = self.marker_line("VarDecl", Some(name.clone()), *span, &indent);
-                let mut line = format!("{}{}", indent, name);
+                let mut line = format!("{}{}", indent, python_name);
                 let expr_str = expr.as_ref().map(|e| self.transpile_expr(e));
                 if let Some(ty) = var_type.as_ref().and_then(|ty| self.render_type(ty)) {
                     if let Some(expr_value) = expr_str {
@@ -390,12 +481,14 @@ impl PythonTranspiler {
                 span,
             } => {
                 self.needs_enum = true;
+                let python_name = self.export_python_name(name);
                 for variant in variants {
-                    self.enum_variants.insert(variant.clone(), name.clone());
+                    self.enum_variants
+                        .insert(variant.clone(), python_name.clone());
                 }
                 let indent = self.indent();
                 let mut result = self.marker_line("EnumDef", Some(name.clone()), *span, &indent);
-                result.push_str(&format!("{}class {}(Enum):\n", indent, name));
+                result.push_str(&format!("{}class {}(Enum):\n", indent, python_name));
                 self.indent_level += 1;
                 if variants.is_empty() {
                     result.push_str(&format!("{}pass\n", self.indent()));
@@ -957,6 +1050,11 @@ impl PythonTranspiler {
             }
             Expr::MemberAccess { target, member, .. } => {
                 if let Some(target_expr) = target {
+                    if let Some(rewritten) =
+                        self.resolve_module_member(target_expr.as_ref(), member.as_str())
+                    {
+                        return rewritten;
+                    }
                     if let Expr::OptionalChaining { target: inner } = target_expr.as_ref() {
                         let base = self.transpile_expr(inner.as_ref());
                         let temp = self.new_temp();
@@ -1302,13 +1400,21 @@ impl PythonTranspiler {
     }
 }
 
-pub fn transpile_to_python_with_map(ast: &AstNode) -> (String, Vec<SourceMapEntry>) {
-    let mut transpiler = PythonTranspiler::new();
+pub fn transpile_with_context(
+    ast: &AstNode,
+    ctx: Option<TypePyTranspileContext>,
+) -> (String, Vec<SourceMapEntry>) {
+    let mut transpiler = PythonTranspiler::with_typepy_context(ctx);
     transpiler.transpile(ast)
 }
 
 #[allow(dead_code)]
+pub fn transpile_to_python_with_map(ast: &AstNode) -> (String, Vec<SourceMapEntry>) {
+    transpile_with_context(ast, None)
+}
+
+#[allow(dead_code)]
 pub fn transpile_to_python(ast: &AstNode) -> String {
-    let (code, _) = transpile_to_python_with_map(ast);
+    let (code, _) = transpile_with_context(ast, None);
     code
 }

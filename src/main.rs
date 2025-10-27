@@ -1,4 +1,5 @@
 mod analyzer;
+mod bundler;
 mod keyword_map;
 mod lexer;
 mod optimizer;
@@ -104,10 +105,10 @@ fn main() -> io::Result<()> {
             if check_only {
                 println!("Analysis succeeded.");
             } else {
-                let (python_code, source_map) =
-                    transpiler::transpile_to_python_with_map(&analyzer.root_node);
+                let bundle =
+                    bundler::bundle_project(Path::new(filename), &analyzer.root_node, use_std)?;
                 let output_py = Path::new(filename).with_extension("py");
-                fs::write(&output_py, &python_code)?;
+                fs::write(&output_py, &bundle.code)?;
                 println!("Transpiled Python written to {}", output_py.display());
 
                 if emit_source_map {
@@ -119,7 +120,7 @@ fn main() -> io::Result<()> {
                             .and_then(|s| s.to_str())
                             .unwrap_or_default(),
                         "source": filename,
-                        "mappings": source_map,
+                        "mappings": bundle.source_map,
                     });
                     let pretty = serde_json::to_string_pretty(&payload)?;
                     fs::write(&output_map, pretty)?;

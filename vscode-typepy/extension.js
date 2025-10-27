@@ -134,6 +134,8 @@ class FileMapping {
     this.maxGeneratedLine = countFileLines(pythonPath);
     this.originalAnchors = [];
     this.generatedAnchors = [];
+    this.minGeneratedAnchor = Number.POSITIVE_INFINITY;
+    this.maxGeneratedAnchor = Number.NEGATIVE_INFINITY;
 
     if (Array.isArray(rawMappings)) {
       rawMappings
@@ -145,11 +147,23 @@ class FileMapping {
           const generated = Math.max(1, Math.floor(entry.generated_line));
           this.originalAnchors.push({ original, generated });
           this.generatedAnchors.push({ original, generated });
+          if (generated < this.minGeneratedAnchor) {
+            this.minGeneratedAnchor = generated;
+          }
+          if (generated > this.maxGeneratedAnchor) {
+            this.maxGeneratedAnchor = generated;
+          }
         });
     }
 
     this.originalAnchors.sort((a, b) => a.original - b.original);
     this.generatedAnchors.sort((a, b) => a.generated - b.generated);
+    if (!Number.isFinite(this.minGeneratedAnchor)) {
+      this.minGeneratedAnchor = null;
+    }
+    if (!Number.isFinite(this.maxGeneratedAnchor)) {
+      this.maxGeneratedAnchor = null;
+    }
   }
 
   clampGenerated(line) {
@@ -201,6 +215,23 @@ class FileMapping {
     const offset = anchor.original - anchor.generated;
     return this.clampOriginal(line + offset);
   }
+
+  distanceToGenerated(line) {
+    if (!Number.isFinite(line) || this.generatedAnchors.length === 0) {
+      return null;
+    }
+    let best = Number.POSITIVE_INFINITY;
+    for (const anchor of this.generatedAnchors) {
+      const diff = Math.abs(anchor.generated - line);
+      if (diff < best) {
+        best = diff;
+        if (best === 0) {
+          break;
+        }
+      }
+    }
+    return best;
+  }
 }
 
 class SourceMapRegistry {
@@ -212,14 +243,63 @@ class SourceMapRegistry {
 
   registerFromPayload(typepyPath, pythonPath, sourceMapPayload) {
     try {
-      const mapping = new FileMapping(typepyPath, pythonPath, sourceMapPayload?.mappings || []);
-      if (mapping.originalAnchors.length === 0) {
-        this.outputChannel.appendLine(
-          `TypePy Debug: Source map for ${typepyPath} is sparse; breakpoint mapping may be approximate.`
-        );
+      const rawMappings = Array.isArray(sourceMapPayload?.mappings)
+        ? sourceMapPayload.mappings
+        : [];
+      const groupedMappings = new Map();
+      for (const entry of rawMappings) {
+        const originalFile =
+          entry.original_file ||
+          entry.originalFile ||
+          sourceMapPayload?.source ||
+          typepyPath;
+        if (!originalFile) {
+          continue;
+        }
+        if (
+          !Number.isFinite(entry.original_line) ||
+          !Number.isFinite(entry.generated_line)
+        ) {
+          continue;
+        }
+        const list = groupedMappings.get(originalFile) || [];
+        list.push(entry);
+        groupedMappings.set(originalFile, list);
       }
-      this.mappingsByTypepy.set(mapping.normalizedTypepyPath, mapping);
-      this.mappingsByPython.set(mapping.normalizedPythonPath, mapping);
+
+      if (groupedMappings.size === 0) {
+        const fallback = new FileMapping(typepyPath, pythonPath, rawMappings);
+        if (fallback.originalAnchors.length === 0) {
+          this.outputChannel.appendLine(
+            `TypePy Debug: Source map for ${typepyPath} is sparse; breakpoint mapping may be approximate.`
+          );
+        }
+        this.mappingsByTypepy.set(fallback.normalizedTypepyPath, fallback);
+        this.mappingsByPython.set(fallback.normalizedPythonPath, [fallback]);
+        return;
+      }
+
+      for (const [source, entries] of groupedMappings) {
+        const mapping = new FileMapping(source, pythonPath, entries);
+        if (mapping.originalAnchors.length === 0) {
+          this.outputChannel.appendLine(
+            `TypePy Debug: Source map for ${source} is sparse; breakpoint mapping may be approximate.`
+          );
+        }
+        this.mappingsByTypepy.set(mapping.normalizedTypepyPath, mapping);
+        const normalizedPython = mapping.normalizedPythonPath;
+        const list = this.mappingsByPython.get(normalizedPython);
+        if (list) {
+          list.push(mapping);
+          list.sort((a, b) => {
+            const aVal = Number.isFinite(a.minGeneratedAnchor) ? a.minGeneratedAnchor : Number.POSITIVE_INFINITY;
+            const bVal = Number.isFinite(b.minGeneratedAnchor) ? b.minGeneratedAnchor : Number.POSITIVE_INFINITY;
+            return aVal - bVal;
+          });
+        } else {
+          this.mappingsByPython.set(normalizedPython, [mapping]);
+        }
+      }
     } catch (error) {
       this.outputChannel.appendLine(
         `TypePy Debug: Failed to register source map for ${typepyPath}: ${error.message}`
@@ -247,13 +327,31 @@ class SourceMapRegistry {
   }
 
   mapGeneratedToOriginal(pythonPath, line) {
-    const mapping = this.getMappingForPython(pythonPath);
-    if (!mapping) {
+    const mappings = this.getMappingForPython(pythonPath);
+    if (!mappings || mappings.length === 0) {
+      return null;
+    }
+    let chosen = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const mapping of mappings) {
+      const distance = mapping.distanceToGenerated(line);
+      if (distance === null) {
+        continue;
+      }
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        chosen = mapping;
+        if (distance === 0) {
+          break;
+        }
+      }
+    }
+    if (!chosen) {
       return null;
     }
     return {
-      path: mapping.typepyPath,
-      line: mapping.generatedToOriginal(line)
+      path: chosen.typepyPath,
+      line: chosen.generatedToOriginal(line)
     };
   }
 }
@@ -321,6 +419,7 @@ class TypePyDebugAdapter {
     this.onDidSendMessage = this.onDidSendMessageEmitter.event;
     this.pendingRequests = new Map();
     this.sourceMaps = new SourceMapRegistry(outputChannel);
+    this.pythonBreakpoints = new Map();
     this.disposed = false;
     this.sequenceCounter = 1;
     this.startError = null;
@@ -449,28 +548,91 @@ class TypePyDebugAdapter {
         const originalSourcePath = args.source.path;
         const newArgs = { ...args };
         const newSource = { ...args.source };
-        const breakpoints = Array.isArray(args.breakpoints)
+        const clientBreakpoints = Array.isArray(args.breakpoints)
           ? args.breakpoints.map((bp) => ({ ...bp }))
           : [];
 
-        let mappedSourcePath = null;
-        breakpoints.forEach((bp, index) => {
+        const mappedEntries = clientBreakpoints.map((bp) => {
           const mapped = this.sourceMaps.mapOriginalToGenerated(originalSourcePath, bp.line);
-          if (mapped) {
-            breakpoints[index].line = mapped.line;
-            mappedSourcePath = mapped.path || mappedSourcePath;
-          }
+          return {
+            original: bp,
+            typepySource: originalSourcePath,
+            typepyLine: bp.line,
+            pythonLine: mapped ? mapped.line : bp.line,
+            mappedPath: mapped?.path || null
+          };
         });
 
-        if (mappedSourcePath) {
-          newSource.path = mappedSourcePath;
-          newSource.name = path.basename(mappedSourcePath);
+        let mappedSourcePath = null;
+        for (const entry of mappedEntries) {
+          if (entry.mappedPath) {
+            mappedSourcePath = entry.mappedPath;
+            break;
+          }
         }
 
-        newArgs.source = newSource;
-        newArgs.breakpoints = breakpoints;
         metadata.typepySource = originalSourcePath;
-        metadata.pythonSource = mappedSourcePath || originalSourcePath;
+        if (mappedSourcePath) {
+          const normalizedPythonPath = normalizeFsPath(mappedSourcePath);
+          const existingEntries = this.pythonBreakpoints.get(normalizedPythonPath) || [];
+          const retainedEntries = existingEntries.filter(
+            (entry) => normalizeFsPath(entry.typepySource) !== normalizeFsPath(originalSourcePath)
+          );
+          const newEntries = mappedEntries.map((entry) => ({
+            typepySource: entry.typepySource,
+            typepyLine: entry.typepyLine,
+            pythonLine: entry.pythonLine,
+            clientBreakpoint: entry.original,
+            dapIndex: -1
+          }));
+          const combinedEntries = [...retainedEntries, ...newEntries];
+          combinedEntries.sort((a, b) => {
+            if (a.pythonLine !== b.pythonLine) {
+              return a.pythonLine - b.pythonLine;
+            }
+            if (a.typepySource !== b.typepySource) {
+              return a.typepySource.localeCompare(b.typepySource);
+            }
+            return a.typepyLine - b.typepyLine;
+          });
+          combinedEntries.forEach((entry, index) => {
+            entry.dapIndex = index;
+          });
+
+          const forwardedBreakpoints = combinedEntries.map((entry) => {
+            const payload = { ...entry.clientBreakpoint };
+            payload.line = entry.pythonLine;
+            return payload;
+          });
+
+          if (combinedEntries.length === 0) {
+            this.pythonBreakpoints.delete(normalizedPythonPath);
+          } else {
+            this.pythonBreakpoints.set(normalizedPythonPath, combinedEntries);
+          }
+
+          newSource.path = mappedSourcePath;
+          newSource.name = path.basename(mappedSourcePath);
+          newArgs.source = newSource;
+          newArgs.breakpoints = forwardedBreakpoints;
+
+          metadata.pythonSource = mappedSourcePath;
+          metadata.pythonSourceNormalized = normalizedPythonPath;
+          metadata.forwardedIndices = newEntries.map((entry) => entry.dapIndex);
+          metadata.typepyLines = newEntries.map((entry) => entry.typepyLine);
+          metadata.breakpointEntries = newEntries;
+        } else {
+          const remappedBreakpoints = mappedEntries.map((entry) => {
+            const payload = { ...entry.original };
+            payload.line = entry.pythonLine;
+            return payload;
+          });
+          newArgs.source = newSource;
+          newArgs.breakpoints = remappedBreakpoints;
+          metadata.pythonSource = newSource.path;
+          metadata.forwardedIndices = [];
+        }
+
         return {
           ...message,
           arguments: newArgs
@@ -535,7 +697,76 @@ class TypePyDebugAdapter {
     if (!pythonSource || !typepySource) {
       return;
     }
-    message.body.breakpoints = message.body.breakpoints.map((bp) => {
+    const adapterBreakpoints = message.body.breakpoints.slice();
+
+    if (metadata.pythonSourceNormalized) {
+      const stored = this.pythonBreakpoints.get(metadata.pythonSourceNormalized);
+      if (stored) {
+        stored.forEach((entry) => {
+          if (!Number.isInteger(entry.dapIndex)) {
+            return;
+          }
+          const bp = adapterBreakpoints[entry.dapIndex];
+          if (bp && Number.isFinite(bp.line)) {
+            entry.pythonLine = bp.line;
+          }
+        });
+        stored.sort((a, b) => {
+          if (a.pythonLine !== b.pythonLine) {
+            return a.pythonLine - b.pythonLine;
+          }
+          if (a.typepySource !== b.typepySource) {
+            return a.typepySource.localeCompare(b.typepySource);
+          }
+          return a.typepyLine - b.typepyLine;
+        });
+        stored.forEach((entry, index) => {
+          entry.dapIndex = index;
+        });
+        if (stored.length === 0) {
+          this.pythonBreakpoints.delete(metadata.pythonSourceNormalized);
+        } else {
+          this.pythonBreakpoints.set(metadata.pythonSourceNormalized, stored);
+        }
+      }
+
+      const forwardedIndices = Array.isArray(metadata.forwardedIndices)
+        ? metadata.forwardedIndices
+        : [];
+      if (forwardedIndices.length === 0) {
+        message.body.breakpoints = [];
+        return;
+      }
+      const responseBreakpoints = [];
+      const normalizedTypepySource = normalizeFsPath(typepySource);
+      forwardedIndices.forEach((index, position) => {
+        const bp = adapterBreakpoints[index];
+        if (!bp) {
+          return;
+        }
+        const mapped = this.sourceMaps.mapGeneratedToOriginal(pythonSource, bp.line);
+        let targetLine =
+          Array.isArray(metadata.typepyLines) && metadata.typepyLines[position] !== undefined
+            ? metadata.typepyLines[position]
+            : bp.line;
+        if (mapped && normalizeFsPath(mapped.path) === normalizedTypepySource) {
+          targetLine = mapped.line;
+        }
+        const source = { ...(bp.source || {}) };
+        source.path = typepySource;
+        source.name = path.basename(typepySource);
+        source.origin = "TypePy";
+        responseBreakpoints.push({
+          ...bp,
+          source,
+          line: targetLine
+        });
+      });
+      message.body.breakpoints = responseBreakpoints;
+      return;
+    }
+
+    message.body.breakpoints = adapterBreakpoints.map((bp) => {
       const mapped = this.sourceMaps.mapGeneratedToOriginal(pythonSource, bp.line);
       if (mapped) {
         const source = { ...(bp.source || {}) };
@@ -580,6 +811,7 @@ class TypePyDebugAdapter {
       }
     }
     this.onDidSendMessageEmitter.dispose();
+    this.pythonBreakpoints.clear();
   }
 }
 
